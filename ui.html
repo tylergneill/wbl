@@ -1,0 +1,639 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WayBackLog Machine</title>
+<!--
+  The WayBackLog Machine's browser front end. One static page, no build step, no dependencies.
+  It polls GET /api/state and re-renders the board; edits go to the small JSON API in
+  wbl_server.py, which writes the same ticket files the CLI uses.
+-->
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1d1f; --muted: #6b6b70; --line: #e3e1dc;
+    --accent: #2f5d8a; --p0: #c0392b; --p1: #c47f17; --p2: #6d7f91;
+    --ok: #2e7d4f; --bad: #b03a2e; --code: #f0eee9; --add: #e6f4ea; --del: #fbeaea;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17181a; --panel: #212226; --ink: #e8e6e1; --muted: #9a9aa0; --line: #33343a;
+      --accent: #7fb0e0; --p0: #e5675a; --p1: #e0a64a; --p2: #8ea0b2;
+      --ok: #5fbf86; --bad: #e5675a; --code: #2a2b30; --add: #1f3326; --del: #3a2222;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+  button, select, input { font: inherit; color: inherit; }
+  button { background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+           padding: 5px 11px; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { color: var(--bad); }
+  select { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+
+  header { display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+           padding: 12px 18px; border-bottom: 1px solid var(--line); background: var(--panel);
+           position: sticky; top: 0; z-index: 5; }
+  header h1 { font-size: 17px; margin: 0 8px 0 0; letter-spacing: .02em; }
+  header .spacer { flex: 1; }
+  #jobs { font-size: 12px; color: var(--muted); }
+  #jobs .running::before { content: "● "; color: var(--p1); }
+  #jobs button { padding: 0 6px; font-size: 11px; margin-left: 4px; }
+  .card .busy { font-size: 11px; color: var(--p1); }
+
+  main { display: grid; grid-template-columns: repeat(5, minmax(220px, 1fr)); gap: 14px;
+         padding: 16px 18px; overflow-x: auto; align-items: start; }
+  .col h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted);
+            margin: 0 0 8px; display: flex; justify-content: space-between; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+          padding: 9px; margin-bottom: 8px; cursor: pointer; display: grid;
+          grid-template-columns: 52px 1fr; gap: 9px; }
+  .card:hover { border-color: var(--accent); }
+  .card.selected { outline: 2px solid var(--accent); }
+  .card img { width: 52px; height: 52px; object-fit: cover; border-radius: 4px; background: var(--code); }
+  .card .meta { display: flex; gap: 6px; align-items: center; font-size: 12px; color: var(--muted); }
+  .card .title { margin-top: 3px; font-size: 13px; overflow-wrap: anywhere; }
+  .card input[type=checkbox] { margin: 0 0 0 auto; }
+  .col h2 button { border: 0; background: none; padding: 0; font-size: 11px; color: var(--accent);
+                   text-transform: none; letter-spacing: 0; }
+  /* Card thumbnails for non-image inputs: a tiny white "page", plus a file-type tag. */
+  .thumb { position: relative; width: 52px; height: 52px; }
+  .thumb .page { width: 52px; height: 52px; border-radius: 4px; background: #fff; color: #333;
+                 overflow: hidden; font: 5.5px/1.25 ui-monospace, Menlo, monospace; padding: 4px;
+                 white-space: pre-wrap; overflow-wrap: anywhere; }
+  .thumb img { background: #fff; object-fit: cover; object-position: top; }
+  .thumb .ext { position: absolute; right: 2px; bottom: 2px; font: 600 8px/1 -apple-system, sans-serif;
+                background: var(--ink); color: var(--bg); border-radius: 3px; padding: 2px 3px; }
+  .missing { min-height: 52px; display: grid; place-items: center; text-align: center; font-size: 11px;
+             color: var(--muted); background: var(--code); border-radius: 4px; padding: 6px; }
+  .pill { font-weight: 600; font-size: 11px; padding: 0 6px; border-radius: 10px; color: #fff; }
+  .P0 { background: var(--p0); } .P1 { background: var(--p1); } .P2 { background: var(--p2); }
+  .pts { border: 1px solid var(--line); border-radius: 10px; padding: 0 6px; font-size: 11px; }
+  /* Which repo of a multi-repo project a ticket lives in. */
+  .comp { border: 1px solid var(--accent); color: var(--accent); border-radius: 4px; padding: 0 6px;
+          font-size: 11px; font-weight: 600; white-space: nowrap; }
+  #drawer .where { font-size: 13px; color: var(--muted); margin: 10px 0 2px; }
+  #drawer .where .comp { font-size: 12px; margin-left: 2px; }
+  .empty { color: var(--muted); font-size: 12px; padding: 6px 2px; }
+
+  /* Detail drawer */
+  #drawer { position: fixed; top: 0; right: 0; bottom: 0; width: min(760px, 100vw);
+            background: var(--panel); border-left: 1px solid var(--line); z-index: 10;
+            overflow-y: auto; padding: 18px 22px 40px; box-shadow: -8px 0 24px rgba(0,0,0,.12);
+            transform: translateX(105%); transition: transform .18s ease; }
+  #drawer.open { transform: none; }
+  #drawer h2 { margin: 4px 0 12px; font-size: 19px; }
+  #drawer .shot { width: 100%; max-height: 420px; object-fit: contain; background: var(--code);
+                  border-radius: 6px; cursor: zoom-in; }
+  #drawer .doc { width: 100%; height: 520px; border: 1px solid var(--line); border-radius: 6px;
+                 background: #fff; }
+  #drawer .note { max-height: 520px; overflow: auto; border: 1px solid var(--line); border-radius: 6px;
+                  padding: 4px 14px; background: var(--code); }
+  #drawer .note pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .fields { display: flex; flex-wrap: wrap; gap: 14px; margin: 12px 0; align-items: end; }
+  .fields label { font-size: 11px; color: var(--muted); display: grid; gap: 3px;
+                  text-transform: uppercase; letter-spacing: .06em; }
+  .kv { font-size: 12.5px; color: var(--muted); margin: 6px 0; overflow-wrap: anywhere; }
+  .kv code { background: var(--code); padding: 1px 5px; border-radius: 4px; color: var(--ink); }
+  .actions { display: flex; gap: 8px; margin: 14px 0; flex-wrap: wrap; }
+  .spec { border-top: 1px solid var(--line); margin-top: 10px; }
+  .spec h1, .spec h2, .spec h3 { font-size: 15px; margin: 18px 0 6px; }
+  .spec pre, pre.diff { background: var(--code); padding: 10px; border-radius: 6px; overflow-x: auto; }
+  .spec code { background: var(--code); padding: 1px 4px; border-radius: 3px; }
+  .spec pre code { background: none; padding: 0; }
+  pre.diff span { display: block; }
+  pre.diff .a { background: var(--add); }
+  pre.diff .d { background: var(--del); }
+  pre.diff .h { color: var(--accent); }
+  #ctx { position: fixed; z-index: 30; background: var(--panel); border: 1px solid var(--line);
+         border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,.18); padding: 4px; min-width: 170px;
+         display: none; }
+  #ctx button { display: block; width: 100%; text-align: left; border: 0; border-radius: 5px;
+                background: none; padding: 6px 10px; }
+  #ctx button:hover:not(:disabled) { background: var(--code); }
+  /* Token coin on buttons that start agents (i.e. spend tokens). */
+  .tok { width: 1.05em; height: 1.05em; vertical-align: -0.2em; margin-left: 5px; flex: none; }
+  #toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); z-index: 20;
+           background: var(--ink); color: var(--bg); padding: 8px 14px; border-radius: 8px;
+           font-size: 13px; display: none; max-width: 80vw; }
+</style>
+</head>
+<body>
+<header>
+  <h1>WayBackLog Machine</h1>
+  <select id="projectFilter"><option value="">All projects</option></select>
+  <button id="prepBtn" disabled>Prep selected</button>
+  <button id="doBtn" class="primary" disabled>Do selected</button>
+  <span class="spacer"></span>
+  <span id="jobs"></span>
+</header>
+<main id="board"></main>
+<aside id="drawer"></aside>
+<div id="toast"></div>
+<div id="ctx" role="menu"></div>
+
+<script>
+// ---------------------------------------------------------------------------------------------
+// State. `state` is the last /api/state payload. Cards are keyed by ticket ID, or by
+// "inbox:<project>/<image>" for an untriaged screenshot; `selected` holds the keys of ticked
+// cards (inbox ones get prepped, tickets get done), and `openId` is the card shown in the drawer.
+// ---------------------------------------------------------------------------------------------
+let state = null;
+const selected = new Set();
+let openId = null;
+let openSnapshot = "";   // JSON of the ticket when the drawer was drawn, to redraw only on change
+
+const COLUMNS = [
+  ["inbox", "Inbox"], ["pending", "Pending"], ["in_progress", "In progress"],
+  ["review", "Review"], ["failed", "Failed"],
+];
+const $ = (sel) => document.querySelector(sel);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+  (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+
+async function api(path, body) {
+  const opts = body === undefined ? {} :
+    {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)};
+  const r = await fetch(path, opts);
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
+
+// Placeholder for a screenshot that has been moved or deleted since triage.
+// Previews for an input (inbox item or ticket: both carry kind, image_url, thumb_url, excerpt).
+const extOf = (name) => (name.match(/\.([^.]+)$/)?.[1] || "").toUpperCase();
+
+function thumbHtml(x) {
+  if (x.image_missing) return '<div class="missing">missing</div>';
+  if (x.kind === "image")
+    return `<img src="${esc(x.image_url)}" loading="lazy" alt="" onerror="this.replaceWith(missingImg())">`;
+  const inner = x.kind === "pdf"
+    ? `<img src="${esc(x.thumb_url)}" loading="lazy" alt="" onerror="this.replaceWith(missingImg('PDF'))">`
+    : `<div class="page">${esc(x.excerpt)}</div>`;
+  return `<div class="thumb">${inner}<span class="ext">${esc(extOf(x.image))}</span></div>`;
+}
+
+function previewHtml(x) {
+  if (x.image_missing)
+    return `<div class="missing">${esc(x.image)} is missing from the project folder (renamed?). ` +
+           `Discard this ticket, then prep the file under its new name.</div>`;
+  if (x.kind === "pdf") return `<iframe class="doc" src="${esc(x.image_url)}" title="${esc(x.image)}"></iframe>`;
+  if (x.kind === "text") return `<div class="note" data-note="${esc(x.image_url)}"><div class="empty">loading…</div></div>`;
+  return `<img class="shot" src="${esc(x.image_url)}" onclick="window.open(this.src)" ` +
+         `onerror="this.replaceWith(missingImg('${esc(x.image)} is missing from the project folder'))">`;
+}
+
+// Text notes are fetched after the drawer is drawn: Markdown rendered, plain text as is.
+async function fillNotes(root) {
+  for (const el of root.querySelectorAll("[data-note]")) {
+    try {
+      const text = await (await fetch(el.dataset.note)).text();
+      el.innerHTML = /\.md$/i.test(el.dataset.note) ? md(text) : `<pre>${esc(text)}</pre>`;
+    } catch { el.innerHTML = '<div class="empty">could not load the note</div>'; }
+  }
+}
+
+function missingImg(text = "no image") {
+  const el = document.createElement("div");
+  el.className = "missing"; el.textContent = text;
+  return el;
+}
+
+// Buttons that start agents carry a gold token coin. We don't predict cost: hovering shows
+// what past runs of that kind actually used (median, in millions of tokens), and the per-run
+// dollar limit Claude Code enforces, which is a ceiling and not an estimate.
+const TOKEN = `<svg class="tok" viewBox="0 0 16 16" aria-label="spends tokens">
+  <circle cx="8" cy="8" r="7.5" fill="#e9b23f"/><circle cx="8" cy="8" r="5.3" fill="#d39a22"/>
+  <path d="M8 3.9C8.4 6.6 9.4 7.6 12.1 8 9.4 8.4 8.4 9.4 8 12.1 7.6 9.4 6.6 8.4 3.9 8 6.6 7.6 7.6 6.6 8 3.9Z" fill="#fff6dc"/></svg>`;
+const NOUN = {triage: "Prep", resolve: "Do"};
+const mtok = (n) => `${(n / 1e6).toFixed(n < 1e6 ? 2 : 1)}M`;
+
+function usageNote(kind) {
+  const xs = [...(state[`${kind}_tokens`] || [])].sort((a, b) => a - b);
+  if (!xs.length) return `No past ${NOUN[kind]} runs to go by yet.`;
+  const median = xs[Math.floor(xs.length / 2)];
+  const range = mtok(xs[0]) === mtok(xs.at(-1)) ? "" : `, range ${mtok(xs[0])}–${mtok(xs.at(-1))}`;
+  return `Past ${NOUN[kind]} runs: typically ${mtok(median)} tokens (median of ${xs.length}${range}).`;
+}
+function limitNote(kind) {
+  const each = state[`${kind}_budget_usd`];
+  return each ? `Each run is stopped at $${each.toFixed(2)}.` : "No per-run limit is set.";
+}
+const spendTitle = (kind) => `Spends tokens. ${usageNote(kind)} ${limitNote(kind)}`;
+const prepLabel = () => `Prep${TOKEN}`;
+const doLabel = (t) => `${t.worktree ? "Do again" : "Do"}${TOKEN}`;
+
+// An inbox item is being prepped if a running triage job names it.
+function triaging(item) {
+  return state.jobs.some((j) => j.running && j.kind === "triage" &&
+    j.args.includes(`${item.project}/${item.image}`));
+}
+
+function toast(msg, ms = 3500) {
+  const el = $("#toast");
+  el.textContent = msg; el.style.display = "block";
+  clearTimeout(toast.t); toast.t = setTimeout(() => (el.style.display = "none"), ms);
+}
+
+// ---------------------------------------------------------------------------------------------
+// A deliberately small markdown renderer: headings, fenced code, lists, inline code, bold,
+// paragraphs. That covers what the triage agent writes; anything else shows as plain text.
+// ---------------------------------------------------------------------------------------------
+function md(src) {
+  const inline = (s) => esc(s)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  const out = []; let list = null, para = [], code = null;
+  const flushPara = () => { if (para.length) out.push(`<p>${inline(para.join(" "))}</p>`); para = []; };
+  const flushList = () => { if (list) out.push(`</${list}>`); list = null; };
+  for (const line of src.split("\n")) {
+    if (code !== null) {
+      if (line.startsWith("```")) { out.push(`<pre><code>${esc(code.join("\n"))}</code></pre>`); code = null; }
+      else code.push(line);
+      continue;
+    }
+    let m;
+    if (line.startsWith("```")) { flushPara(); flushList(); code = []; }
+    else if ((m = line.match(/^(#{1,4})\s+(.*)/))) { flushPara(); flushList(); out.push(`<h3>${inline(m[2])}</h3>`); }
+    else if ((m = line.match(/^\s*([-*]|\d+\.)\s+(.*)/))) {
+      flushPara();
+      const kind = /\d/.test(m[1]) ? "ol" : "ul";
+      if (list !== kind) { flushList(); out.push(`<${kind}>`); list = kind; }
+      out.push(`<li>${inline(m[2])}</li>`);
+    }
+    else if (!line.trim()) { flushPara(); flushList(); }
+    else para.push(line.trim());
+  }
+  if (code !== null) out.push(`<pre><code>${esc(code.join("\n"))}</code></pre>`);
+  flushPara(); flushList();
+  return out.join("\n");
+}
+
+function diffHtml(text) {
+  return text.split("\n").map((l) => {
+    const cls = l.startsWith("+") && !l.startsWith("+++") ? "a"
+              : l.startsWith("-") && !l.startsWith("---") ? "d"
+              : l.startsWith("@@") || l.startsWith("diff ") ? "h" : "";
+    // Every line is its own block-level span, so no "\n" between them (that double-spaces).
+    return `<span class="${cls}">${esc(l) || " "}</span>`;
+  }).join("");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Board
+// ---------------------------------------------------------------------------------------------
+const PRI_ORDER = {P0: 0, P1: 1, P2: 2};
+
+// The filter value is "", "<project>", or "<project>/<component>". Inbox items have no
+// component yet, so a component filter still shows the whole project's inbox.
+function filterParts() { const [proj = "", comp = ""] = $("#projectFilter").value.split("/"); return {proj, comp}; }
+// A project without a repo (e.g. "misc") can be prepped and discarded, but not done.
+const hasRepo = (project) => (state.projects.find((p) => p.name === project)?.components.length ?? 0) > 0;
+const multi = (project) => (state.projects.find((p) => p.name === project)?.components.length ?? 0) > 1;
+const proj = (name) => state.projects.find((p) => p.name === name);
+// The component's display label ("Front End"), falling back to its repo name.
+const compLabel = (project, comp) => proj(project)?.labels?.[comp] || comp;
+const compChip = (t) => multi(t.project)
+  ? `<span class="comp" title="repo: ${esc(t.component)}">${esc(compLabel(t.project, t.component))}</span>` : "";
+
+const isInbox = (key) => key.startsWith("inbox:");
+const DOABLE = ["pending", "failed", "review"];
+const checkbox = (key) =>
+  `<input type="checkbox" data-select="${esc(key)}" ${selected.has(key) ? "checked" : ""} title="select (or ⌘-click the card)">`;
+
+function inboxItem(key) {
+  const [project, image] = key.slice(6).split("/");
+  return state.inbox.find((i) => i.project === project && i.image === image);
+}
+
+function renderBoard() {
+  const {proj, comp} = filterParts();
+  const tickets = state.tickets.filter((t) => (!proj || t.project === proj) && (!comp || t.component === comp))
+    .sort((a, b) => PRI_ORDER[a.priority] - PRI_ORDER[b.priority] || a.points - b.points);
+  const inbox = state.inbox.filter((i) => !proj || i.project === proj);
+
+  // Drop selections that no longer apply: prepped or prepping screenshots, tickets gone or running.
+  for (const key of selected) {
+    if (isInbox(key)) { const i = inboxItem(key); if (!i || triaging(i)) selected.delete(key); }
+    else { const t = state.tickets.find((x) => x.id === key); if (!t || !DOABLE.includes(t.status)) selected.delete(key); }
+  }
+
+  $("#board").innerHTML = COLUMNS.map(([col, label]) => {
+    const cards = col === "inbox"
+      ? inbox.map((i) => {
+          const key = `inbox:${i.project}/${i.image}`;
+          return `
+          <div class="card ${selected.has(key) ? "selected" : ""}" data-open="${esc(key)}">
+            ${thumbHtml(i)}
+            <div><div class="meta">${esc(i.project)}${triaging(i) ? ' <span class="busy">prepping…</span>' : checkbox(key)}</div>
+                 <div class="title">${esc(i.image)}</div></div>
+          </div>`;
+        })
+      : tickets.filter((t) => t.status === col).map((t) => `
+          <div class="card ${selected.has(t.id) ? "selected" : ""}" data-open="${esc(t.id)}">
+            ${thumbHtml(t)}
+            <div>
+              <div class="meta">
+                <span class="pill ${t.priority}">${t.priority}</span>
+                <span class="pts">${t.points} pt</span>
+                <span>${esc(t.id)}</span>
+                ${compChip(t)}
+                ${DOABLE.includes(col) ? checkbox(t.id) : ""}
+              </div>
+              <div class="title">${esc(t.title)}</div>
+            </div>
+          </div>`);
+    const pts = col === "inbox" ? "" :
+      ` · ${tickets.filter((t) => t.status === col).reduce((s, t) => s + t.points, 0)} pt`;
+    const all = col === "inbox" && inbox.length ? ' <button data-select-all="inbox">select all</button>' : "";
+    return `<section class="col"><h2><span>${label}${all}</span><span>${cards.length}${pts}</span></h2>
+            ${cards.join("") || '<div class="empty">—</div>'}</section>`;
+  }).join("");
+
+  const preps = selectedPreps(), dos = selectedDoables();
+  $("#prepBtn").innerHTML = `Prep selected (${preps.length})${TOKEN}`;
+  $("#prepBtn").title = spendTitle("triage");
+  $("#prepBtn").disabled = !preps.length;
+  $("#doBtn").innerHTML = `Do selected (${dos.length})${TOKEN}`;
+  $("#doBtn").title = spendTitle("resolve");
+  $("#doBtn").disabled = !dos.length;
+
+  const running = state.jobs.filter((j) => j.running);
+  const last = state.jobs.at(-1);
+  const verb = {triage: "prep", resolve: "do"};
+  $("#jobs").innerHTML = running.length
+    ? running.map((j) => `<span class="running">${verb[j.kind] ?? j.kind} ${esc(j.args.length > 2 ? `${j.args.length} items` : j.args.join(", "))}</span>` +
+        `<button onclick="cancelJob(${j.id})" title="stop this run and its agents">cancel</button>`).join(" · ")
+    : (last ? `last job: ${esc(verb[last.kind] ?? last.kind)} (${last.cancelled ? "cancelled" : `exit ${last.exit_code}`})` : "");
+}
+
+const selectedPreps = () => [...selected].filter(isInbox).map((k) => k.slice(6));
+const selectedDos = () => [...selected].filter((k) => !isInbox(k));   // selected tickets
+const selectedDoables = () => selectedDos().filter((id) => hasRepo(state.tickets.find((t) => t.id === id)?.project));
+
+// ---------------------------------------------------------------------------------------------
+// Drawer (ticket detail)
+// ---------------------------------------------------------------------------------------------
+function renderDrawer(force = false) {
+  const d = $("#drawer");
+  if (!openId) { d.classList.remove("open"); return; }
+
+  if (openId.startsWith("inbox:")) {
+    const [project, image] = openId.slice(6).split("/");
+    const item = state.inbox.find((i) => i.project === project && i.image === image);
+    if (!item) { closeDrawer(); return; }
+    const snap = JSON.stringify([item, triaging(item)]);
+    if (!force && snap === openSnapshot) return;
+    openSnapshot = snap;
+    d.innerHTML = `<button onclick="closeDrawer()">Close</button>
+      <h2>${esc(image)}</h2>
+      <div class="kv">${esc(project)} · untriaged${multi(project)
+        ? ` · Prep will pick the component: ${proj(project).components.map((c) => `<span class="comp">${esc(compLabel(project, c))}</span>`).join(" ")}` : ""}</div>
+      <div class="actions">
+        ${triaging(item) ? '<span class="kv">prepping…</span>'
+          : `<button class="primary" onclick='prep([${esc(JSON.stringify(`${project}/${image}`))}])' title="${spendTitle("triage")}">${prepLabel()}</button>`}
+      </div>
+      ${previewHtml(item)}`;
+    fillNotes(d);
+    d.classList.add("open");
+    return;
+  }
+
+  const t = state.tickets.find((x) => x.id === openId);
+  if (!t) { closeDrawer(); return; }
+  const snap = JSON.stringify(t);
+  // Don't clobber the drawer while you're using a dropdown, and skip redraws when nothing changed.
+  if (!force && (snap === openSnapshot || d.contains(document.activeElement) && document.activeElement.tagName === "SELECT")) return;
+  openSnapshot = snap;
+
+  const opt = (vals, cur) => vals.map((v) => `<option ${v == cur ? "selected" : ""}>${v}</option>`).join("");
+  d.innerHTML = `
+    <button onclick="closeDrawer()">Close</button>
+    <div class="where">${esc(t.project)}${multi(t.project) ? ` › ${compChip(t)}` : ""}</div>
+    <h2>${esc(t.id)} · ${esc(t.title)}</h2>
+    ${previewHtml(t)}
+    <div class="fields">
+      <label>Priority <select data-field="priority">${opt(state.priorities, t.priority)}</select></label>
+      <label>Points <select data-field="points">${opt(state.points, t.points)}</select></label>
+      <label>Status <select data-field="status">${opt(state.statuses, t.status)}</select></label>
+      ${multi(t.project) ? `<label>Component <select data-field="component" ${t.worktree ? "disabled title=\"has a worktree already\"" : ""}>${proj(t.project).components.map((c) => `<option value="${esc(c)}" ${c === t.component ? "selected" : ""}>${esc(compLabel(t.project, c))}</option>`).join("")}</select></label>` : ""}
+    </div>
+    <div class="kv">${esc(t.image)} · created ${esc(t.created)}${multi(t.project) ? ` · repo <code>${esc(t.component)}</code>` : ""}</div>
+    ${t.branch ? `<div class="kv">branch <code>${esc(t.branch)}</code> in <code>${esc(t.worktree)}</code></div>` : ""}
+    ${t.prep_tokens ? `<div class="kv">prep: ${mtok(t.prep_tokens)} tokens ($${Number(t.prep_cost_usd).toFixed(2)})</div>` : ""}
+    ${t.tokens ? `<div class="kv">last do: ${mtok(t.tokens)} tokens ($${Number(t.cost_usd).toFixed(2)})</div>` : ""}
+    ${t.resume_cmd ? `<div class="kv">continue by hand: <code>${esc(t.resume_cmd)}</code>
+        <button onclick="navigator.clipboard.writeText(${esc(JSON.stringify(t.resume_cmd))}); toast('copied')">copy</button></div>` : ""}
+    <div class="actions">
+      ${DOABLE.includes(t.status) && hasRepo(t.project) ? `<button class="primary" onclick="doTickets(['${esc(t.id)}'])" title="${spendTitle("resolve")}">${doLabel(t)}</button>` : ""}
+      ${t.worktree ? `<button onclick="showDiff('${esc(t.id)}')">Show changes</button>` : ""}
+      ${t.status !== "in_progress" && !t.image_missing ? `<button onclick="discard(['${esc(t.id)}'], true)" title="${spendTitle("triage")}">Re-prep${TOKEN}</button>` : ""}
+      ${t.status !== "in_progress" ? `<button onclick="discard(['${esc(t.id)}'])" title="delete the ticket, keep the screenshot (it returns to the inbox)">Discard</button>` : ""}
+      <button class="danger" onclick="finish('${esc(t.id)}')">Done (clean up)</button>
+    </div>
+    <div id="diff"></div>
+    <div class="spec">${md(t.body)}</div>`;
+  fillNotes(d);
+  d.classList.add("open");
+}
+
+function openDrawer(id) { openId = id; openSnapshot = ""; renderDrawer(true); }
+function closeDrawer() { openId = null; $("#drawer").classList.remove("open"); }
+
+async function showDiff(id) {
+  const {diff} = await api(`/api/tickets/${id}/diff`);
+  $("#diff").innerHTML = diff.trim() ? `<pre class="diff">${diffHtml(diff)}</pre>` : '<div class="empty">no changes yet</div>';
+}
+
+// ---------------------------------------------------------------------------------------------
+// Actions
+// ---------------------------------------------------------------------------------------------
+async function setField(id, field, value) {
+  try { await api(`/api/tickets/${id}`, {[field]: field === "points" ? Number(value) : value}); toast(`${id}: ${field} → ${value}`); }
+  catch (e) { toast(e.message); }
+  refresh();
+}
+
+// One item starts right away (its button already shows the cap); several ask first.
+async function prep(keys, ask = true) {
+  if (ask && keys.length > 1 && !confirm(`Prep ${keys.length} screenshots?\n\n` +
+      `This starts ${keys.length} agents, ${state.max_parallel} at a time.\n${usageNote("triage")}\n${limitNote("triage")}`)) return;
+  try {
+    await api("/api/triage", {images: keys});
+    keys.forEach((k) => selected.delete(`inbox:${k}`)); renderBoard();
+    toast(keys.length > 1 ? `prepping ${keys.length} screenshots` : `prepping ${keys[0]}`);
+  } catch (e) { toast(e.message); }
+  setTimeout(refresh, 600);
+}
+
+async function cancelJob(id) {
+  try { await api(`/api/jobs/${id}/cancel`, {}); toast("cancelled"); }
+  catch (e) { toast(e.message); }
+  refresh();
+}
+
+async function doTickets(ids) {
+  if (ids.length > 1 && !confirm(`Start agents on ${ids.join(", ")}?\n\n` +
+      `Each works in its own git worktree, ${state.max_parallel} at a time.\n${usageNote("resolve")}\n${limitNote("resolve")}`)) return;
+  try { await api("/api/resolve", {ids}); ids.forEach((i) => selected.delete(i)); renderBoard(); toast(`started agent(s) on ${ids.join(", ")}`); }
+  catch (e) { toast(e.message); }
+  setTimeout(refresh, 600);
+}
+
+// Remove one ticket via /done (screenshot deleted too) or /discard (screenshot kept, so it
+// returns to the inbox). If its worktree has uncommitted changes, offer to throw them away.
+// Returns true if the ticket is gone.
+async function removeTicket(id, how) {
+  try { const {notes} = await api(`/api/tickets/${id}/${how}`, {}); toast(notes.join("; "), 6000); return true; }
+  catch (e) {
+    if (!/uncommitted/.test(e.message) || !confirm(`${e.message}\n\nThrow those changes away and continue?`)) {
+      toast(e.message); return false;
+    }
+    try { const {notes} = await api(`/api/tickets/${id}/${how}`, {force: true}); toast(notes.join("; "), 6000); return true; }
+    catch (e2) { toast(e2.message); return false; }
+  }
+}
+
+async function finish(id) {
+  if (!confirm(`Finish ${id}? This deletes the ticket and its screenshot, and removes its worktree.`)) return;
+  if (await removeTicket(id, "done")) closeDrawer();
+  refresh();
+}
+
+// Discard tickets but keep their screenshots; with `reprep`, prep those screenshots again.
+// Re-prepped tickets get new IDs, since IDs are never reused.
+async function discard(ids, reprep = false) {
+  const tickets = ids.map((i) => state.tickets.find((t) => t.id === i)).filter(Boolean);
+  const list = ids.join(", ");
+  const msg = reprep
+    ? `Re-prep ${list}?\n\nThe ticket${ids.length > 1 ? "s are" : " is"} replaced by a fresh Prep of the same screenshot (new ID). ` +
+      `Any Do work in a worktree is removed.\n${usageNote("triage")}\n${limitNote("triage")}`
+    : `Discard ${list}?\n\nThe ticket${ids.length > 1 ? "s are" : " is"} deleted, and the screenshot goes back to the inbox. ` +
+      `Any Do work in a worktree is removed.`;
+  if (!confirm(msg)) return;
+  const again = [];
+  for (const t of tickets) {
+    if (await removeTicket(t.id, "discard")) {
+      selected.delete(t.id);
+      if (reprep && !t.image_missing) again.push(`${t.project}/${t.image}`);
+    }
+  }
+  if (openId && ids.includes(openId)) closeDrawer();
+  await refresh();
+  if (again.length) await prep(again, false);
+}
+
+function toggle(key, on = !selected.has(key)) { on ? selected.add(key) : selected.delete(key); }
+
+$("#board").addEventListener("click", (ev) => {
+  if (ev.target.closest("[data-select-all]")) {
+    const {proj} = filterParts();
+    const keys = state.inbox.filter((i) => (!proj || i.project === proj) && !triaging(i))
+      .map((i) => `inbox:${i.project}/${i.image}`);
+    const on = !keys.every((k) => selected.has(k));   // second click clears
+    keys.forEach((k) => toggle(k, on));
+    renderBoard(); return;
+  }
+  const box = ev.target.closest("[data-select]");
+  if (box) { ev.stopPropagation(); toggle(box.dataset.select, box.checked); renderBoard(); return; }
+  const card = ev.target.closest("[data-open]");
+  if (!card) return;
+  // ⌘/Ctrl/Shift-click selects, like a file browser; a plain click opens the card.
+  if ((ev.metaKey || ev.ctrlKey || ev.shiftKey) && card.querySelector("[data-select]")) {
+    toggle(card.dataset.open); renderBoard(); return;
+  }
+  openDrawer(card.dataset.open);
+});
+$("#drawer").addEventListener("change", (ev) => {
+  if (ev.target.dataset.field) setField(openId, ev.target.dataset.field, ev.target.value);
+});
+$("#projectFilter").addEventListener("change", renderBoard);
+$("#prepBtn").addEventListener("click", () => prep(selectedPreps()));
+$("#doBtn").addEventListener("click", () => doTickets(selectedDoables()));
+// Right-click menu on any card. On a card that is part of a selection, it acts on the whole
+// selection of that kind; otherwise on the card alone.
+function closeMenu() { $("#ctx").style.display = "none"; }
+$("#board").addEventListener("contextmenu", (ev) => {
+  const card = ev.target.closest("[data-open]");
+  if (!card) return;
+  ev.preventDefault();
+  const key = card.dataset.open;
+  const items = [];   // [label html, action, disabled, tooltip]
+  if (isInbox(key)) {
+    const item = inboxItem(key);
+    if (!item) return;
+    const group = selected.has(key) ? selectedPreps() : [key.slice(6)];
+    if (triaging(item)) items.push(["Prepping…", null, true]);
+    else items.push([group.length > 1 ? `Prep ${group.length} selected${TOKEN}` : prepLabel(), () => prep(group), false, spendTitle("triage")]);
+  } else {
+    const t = state.tickets.find((x) => x.id === key);
+    if (!t) return;
+    const group = selected.has(key) ? selectedDos() : [key];
+    const doable = group.filter((id) => hasRepo(state.tickets.find((x) => x.id === id)?.project));
+    if (!DOABLE.includes(t.status)) items.push(["Agent running…", null, true]);
+    else if (doable.length)
+      items.push([doable.length > 1 ? `Do ${doable.length} selected${TOKEN}` : doLabel(t), () => doTickets(doable), false, spendTitle("resolve")]);
+    if (DOABLE.includes(t.status)) {
+      const n = group.length > 1 ? ` ${group.length} selected` : "";
+      const reprepable = group.filter((id) => !state.tickets.find((x) => x.id === id)?.image_missing);
+      if (reprepable.length) items.push([`Re-prep${reprepable.length > 1 ? ` ${reprepable.length} selected` : ""}${TOKEN}`,
+                                         () => discard(reprepable, true), false, spendTitle("triage")]);
+      items.push([`Discard${n}`, () => discard(group), false, "delete the ticket, keep the screenshot (it returns to the inbox)"]);
+    }
+  }
+  items.push(["Open", () => openDrawer(key)]);
+
+  const m = $("#ctx");
+  m.innerHTML = items.map(([label, , off, tip], i) =>
+    `<button data-i="${i}" ${off ? "disabled" : ""} title="${esc(tip ?? "")}">${label}</button>`).join("");
+  m.onclick = (e) => {
+    const b = e.target.closest("[data-i]");
+    if (!b || b.disabled) return;
+    closeMenu(); items[b.dataset.i][1]();
+  };
+  m.style.display = "block";
+  // Keep the menu on screen near the right and bottom edges.
+  m.style.left = `${Math.min(ev.clientX, innerWidth - m.offsetWidth - 8)}px`;
+  m.style.top = `${Math.min(ev.clientY, innerHeight - m.offsetHeight - 8)}px`;
+});
+document.addEventListener("click", (ev) => { if (!ev.target.closest("#ctx")) closeMenu(); });
+addEventListener("blur", closeMenu);
+addEventListener("scroll", closeMenu, true);
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape") { closeMenu(); closeDrawer(); return; }
+  // Delete (⌫ on a Mac keyboard reports as Backspace) discards tickets: the selected ones, else
+  // the one open in the drawer. Screenshots are kept. Not while typing in a field.
+  const typing = ev.target.closest?.("textarea, select, input:not([type=checkbox]):not([type=radio])");
+  if ((ev.key === "Delete" || ev.key === "Backspace") && !typing) {
+    const ids = selectedDos().length ? selectedDos()
+              : openId && !isInbox(openId) ? [openId] : [];
+    if (ids.length) { ev.preventDefault(); closeMenu(); discard(ids); }
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// Polling
+// ---------------------------------------------------------------------------------------------
+async function refresh() {
+  try { state = await api("/api/state"); } catch (e) { $("#jobs").textContent = "server unreachable"; return; }
+  const pf = $("#projectFilter");
+  if (pf.options.length === 1) {
+    for (const p of state.projects) {
+      pf.add(new Option(`${p.name} (${p.key})`, p.name));
+      if (p.components.length > 1)
+        for (const c of p.components) pf.add(new Option(`\u2003${p.name} › ${p.labels[c] || c}`, `${p.name}/${c}`));
+    }
+  }
+  document.title = `WayBackLog · ${state.tickets.length}`;
+  renderBoard(); renderDrawer();
+}
+refresh();
+setInterval(refresh, 4000);
+</script>
+</body>
+</html>
