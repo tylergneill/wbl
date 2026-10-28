@@ -11,23 +11,27 @@ The whole input surface is a folder of screenshots:
         .wbl/                     <- wbl's own state for this project (hidden in Finder)
           SKR-7.md                <- one ticket = one markdown file
           counter                 <- last ID handed out, so IDs are never reused
-          logs/SKR-7-resolve.json <- raw agent output, for debugging
+          prepping/               <- a marker per screenshot whose Prep session is running
 
 Lifecycle of a ticket (UI button names in quotes; "Prep" = triage, "Do" = resolve):
 
     screenshot dropped in   ->  inbox (no ticket file yet)
-    "Prep"                  ->  pending      agent reads image + filename + repos, writes spec,
-                                             picks the component, estimates priority (P0-P2)
-                                             and points (1-13)
-    "Do"                    ->  in_progress  one git worktree + branch per ticket, agents run in parallel
-                            ->  review       agent finished; changes sit uncommitted in the worktree
-                            ->  failed       agent errored or hit its budget
-    "Done"                  ->  (gone)       worktree removed, merged branch deleted,
-                                             screenshot + ticket file + logs deleted
+    "Prep"                  ->  pending      a Claude Code session in a Terminal window reads the input,
+                                             the code and anything else it needs (web, packages), and
+                                             ends with a short ticket; wbl files it from that message
+    "Do"                    ->  in_progress  a Claude Code session in a Terminal window edits the repo
+                                             where it is, on whatever branch you have checked out.
+                                             One ticket at a time per repo, since they share the checkout.
+                            ->  review       Claude finished its turn; its report is on the ticket and its
+                                             changes sit uncommitted in your checkout
+                            ->  failed       the session ended without a report
+    "Done"                  ->  (gone)       screenshot + ticket file deleted (branches and commits are
+                                             yours to manage)
 
-Both agent layers shell out to Claude Code in headless mode (`claude -p`), so they use whatever
-auth and settings your Claude Code already has. Triage is read-only; resolve may edit files and
-run a whitelisted set of shell commands, but only inside its own worktree, and never commits.
+Agents are ordinary Claude Code sessions, so they use whatever auth and settings your Claude Code
+already has, and the session is the only record of a run: wbl keeps no logs. Claude Code tells
+wbl when the agent finishes a turn through hooks (`wbl hook`), so results land on the board while
+the session is still open. Agents never commit or switch branches.
 
 Standard library only; Python 3.11+ (for tomllib). Start it with `make run`.
 """
@@ -38,13 +42,17 @@ import argparse
 import fcntl
 import json
 import os
+import re
+import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import tomllib
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -119,9 +127,9 @@ class Component:
     front end) has one component per repo; triage decides which one a ticket belongs to."""
 
     name: str        # e.g. "skrutable_front_end" (stored on tickets, so keep it stable)
-    repo: Path       # local clone the agents work against
-    base: str        # branch/commit that resolve branches start from ("HEAD" = whatever is checked out)
+    repo: Path       # local clone the agents work in, on whatever branch is checked out
     label: str = ""  # how the UI shows it, e.g. "Front End"
+    venv: Path | None = None  # Python virtualenv the agents use for this repo
 
 
 ACRONYMS = {"js", "ts", "ui", "api", "css", "db", "cli", "nlp", "v1", "v2", "v3"}
@@ -171,34 +179,16 @@ class Project:
                            f"known: {', '.join(self.components)}")
 
 
-# Commands the resolve agent may run without asking. Everything else is denied automatically,
-# because nobody is there to approve a prompt in headless mode. Edit to taste in wbl.toml.
-DEFAULT_RESOLVE_ALLOWED = [
-    "Read", "Edit", "Write", "Glob", "Grep",
-    "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)",
-    "Bash(ls:*)", "Bash(python:*)", "Bash(python3:*)", "Bash(pytest:*)", "Bash(uv run:*)",
-]
-# Belt and braces: never let an agent publish or rewrite history, even if a rule above is widened.
-DEFAULT_RESOLVE_DISALLOWED = [
-    "Bash(git commit:*)", "Bash(git push:*)", "Bash(git reset:*)", "Bash(git checkout:*)",
-    "Bash(git switch:*)", "Bash(git branch:*)", "Bash(git worktree:*)", "Bash(git rebase:*)",
-    "Bash(rm -rf:*)",
-]
-
-
 @dataclass
 class Config:
     root: Path
     projects: dict[str, Project]
     claude_bin: str = "claude"
-    triage_model: str = "sonnet"
-    resolve_model: str = "sonnet"
-    worktree_root: Path = field(default_factory=lambda: Path.home() / ".wbl" / "worktrees")
-    max_parallel: int = 3
-    triage_budget_usd: float | None = 1.0
-    resolve_budget_usd: float | None = 5.0
-    resolve_allowed_tools: list[str] = field(default_factory=lambda: list(DEFAULT_RESOLVE_ALLOWED))
-    resolve_disallowed_tools: list[str] = field(default_factory=lambda: list(DEFAULT_RESOLVE_DISALLOWED))
+    triage_model: str = "opus"
+    resolve_model: str = "opus"
+    # The terminal app that sessions open in: "Terminal", "iTerm", or an argv list in
+    # which "{cmd}" stands for the shell command to run, e.g. ["kitty", "sh", "-c", "{cmd}"].
+    terminal: str | list[str] = "Terminal"
 
     def project(self, name: str) -> Project:
         try:
@@ -227,20 +217,23 @@ def load_config(root: Path) -> Config:
     projects: dict[str, Project] = {}
     for name, p in raw.get("projects", {}).items():
         # Either one `repo = ...` (a single component named after the project), or
-        # `components = { name = "path", other = { repo = "path", base = "main" } }`.
+        # `components = { name = "path", other = { repo = "path", label = "Front End" } }`.
+        # A component's `venv` (or the project's, for components without one) is the Python
+        # virtualenv agents use there.
         if "components" in p:
             spec = p["components"]
         elif "repo" in p:
-            spec = {name: {"repo": p["repo"], "base": p.get("base", "HEAD")}}
+            spec = {name: {"repo": p["repo"]}}
         else:
             spec = {}  # no code at all (a "misc" folder): Prep still works, Do doesn't
         components = {}
         derived = derive_labels(name, list(spec))
         for cname, c in spec.items():
             c = {"repo": c} if isinstance(c, str) else c
+            venv = c.get("venv", p.get("venv"))
             components[cname] = Component(name=cname, repo=Path(c["repo"]).expanduser().resolve(),
-                                          base=c.get("base", p.get("base", "HEAD")),
-                                          label=c.get("label", derived[cname]))
+                                          label=c.get("label", derived[cname]),
+                                          venv=Path(venv).expanduser() if venv else None)
         name = nfc(name)
         projects[name] = Project(
             name=name,
@@ -250,17 +243,9 @@ def load_config(root: Path) -> Config:
         )
     cfg = Config(root=root, projects=projects)
     # Copy over any defaults that were set; unknown keys are ignored rather than fatal.
-    for key in ("claude_bin", "triage_model", "resolve_model", "max_parallel",
-                "triage_budget_usd", "resolve_budget_usd",
-                "resolve_allowed_tools", "resolve_disallowed_tools"):
+    for key in ("claude_bin", "triage_model", "resolve_model", "terminal"):
         if key in d:
             setattr(cfg, key, d[key])
-    if "worktree_root" in d:
-        cfg.worktree_root = Path(d["worktree_root"]).expanduser().resolve()
-    # Budget 0 in the TOML means "no cap" (TOML has no null).
-    for key in ("triage_budget_usd", "resolve_budget_usd"):
-        if getattr(cfg, key) in (0, 0.0):
-            setattr(cfg, key, None)
     cfg.claude_bin = os.environ.get("WBL_CLAUDE", cfg.claude_bin)  # lets tests swap in a stub
     return cfg
 
@@ -272,7 +257,8 @@ def load_config(root: Path) -> Config:
 # Frontmatter keys, in the order they are written. All values are single-line scalars, so a
 # hand-rolled "key: value" parser is enough and we avoid a YAML dependency.
 FIELDS = ["id", "project", "component", "title", "status", "priority", "points", "image", "created",
-          "branch", "worktree", "session", "tokens", "cost_usd", "prep_tokens", "prep_cost_usd"]
+          "branch", "worktree", "session", "tokens", "cost_usd", "prep_session", "prep_tokens",
+          "prep_cost_usd"]
 INT_FIELDS = {"points", "tokens", "prep_tokens"}
 FLOAT_FIELDS = {"cost_usd", "prep_cost_usd"}
 
@@ -288,12 +274,13 @@ class Ticket:
     image: str               # file name of the input (screenshot, note or PDF) in the project folder
     created: str
     component: str = ""      # which of the project's repos the work happens in ("" = the only one)
-    branch: str = ""
-    worktree: str = ""
-    session: str = ""        # Claude Code session id of the last resolve run (for `claude --resume`)
-    tokens: int | None = None    # total tokens used by the last resolve run
-    cost_usd: float | None = None
-    prep_tokens: int | None = None      # what triage used, so the UI can show what runs typically take
+    branch: str = ""         # only on tickets from before Do worked in your checkout: their
+    worktree: str = ""       #   own branch wbl/<ID> in a separate worktree, cleaned up by Done
+    session: str = ""        # Claude Code session id of the last Do session (for `claude --resume`)
+    tokens: int | None = None    # total tokens that session has used
+    cost_usd: float | None = None    # only on old tickets: Claude Code doesn't log cost for sessions
+    prep_session: str = ""   # the session that prepped it
+    prep_tokens: int | None = None      # what Prep used, so the UI can show what runs typically take
     prep_cost_usd: float | None = None
     body: str = ""           # the markdown spec, plus appended resolution notes
     path: Path | None = None  # where the ticket file lives (not serialized)
@@ -344,8 +331,6 @@ class Ticket:
         d["image_url"] = f"/img/{self.project}/{self.image}"
         d["kind"] = input_kind(self.image)
         d["thumb_url"] = f"/thumb/{self.project}/{self.image}"
-        d["resume_cmd"] = (f"cd {self.worktree} && claude --resume {self.session}"
-                           if self.worktree and self.session else "")
         return d
 
 
@@ -388,7 +373,7 @@ def inbox(cfg: Config, project: str | None = None) -> list[tuple[Project, Path]]
 def allocate_id(project: Project) -> str:
     """Hand out the next ID. An flock on the counter file keeps parallel triage runs (or the CLI
     and the web UI at once) from handing out the same number twice. IDs are never reused, even
-    after a ticket is deleted, so a branch name like wbl/SKR-7 always means one thing."""
+    after a ticket is deleted, so an ID in a commit message or a log always means one thing."""
     project.state_dir.mkdir(parents=True, exist_ok=True)
     counter = project.state_dir / "counter"
     with open(counter, "a+") as fh:
@@ -402,116 +387,195 @@ def allocate_id(project: Project) -> str:
 
 
 # ----------------------------------------------------------------------------------------------
-# Running Claude Code headless
+# Running Claude Code. Every agent run is an ordinary Claude Code session, and that session is
+# the only record of it: wbl keeps no logs. Claude Code calls back into wbl through hooks
+# (`wbl hook`) each time the agent finishes a turn, so the ticket is written while the session is
+# still open. The wbl process around each session repeats that check when `claude` exits, in case
+# a hook never ran (say, the window was closed mid-turn).
 # ----------------------------------------------------------------------------------------------
 
-@dataclass
-class AgentResult:
-    ok: bool
-    text: str                    # the agent's final message
-    structured: dict | None      # parsed --json-schema output, when a schema was given
-    session: str
-    tokens: int
-    cost_usd: float
-    denied: list[str] = field(default_factory=list)  # tool calls the allowlist blocked
-
-
-def run_claude(cfg: Config, prompt: str, *, cwd: Path, model: str, allowed: list[str],
-               disallowed: list[str] = (), permission_mode: str = "dontAsk",
-               add_dirs: list[Path] = (), json_schema: dict | None = None,
-               budget_usd: float | None = None, log_path: Path | None = None) -> AgentResult:
-    """Run one `claude -p` session and return its parsed result.
-
-    The prompt goes in on stdin rather than as an argument: several Claude Code flags
-    (--add-dir, --allowedTools) take a variable number of values and would swallow a trailing
-    positional prompt. `--output-format json` gives one JSON object at the end with the final
-    text, cost, token usage and session id.
-    """
-    cmd = [cfg.claude_bin, "-p", "--output-format", "json", "--model", model,
-           "--permission-mode", permission_mode,
-           "--allowedTools", ",".join(allowed)]
-    if disallowed:
-        cmd += ["--disallowedTools", ",".join(disallowed)]
+def claude_flags(*, model: str, add_dirs: list[Path] = ()) -> list[str]:
+    # No permission flags or tool lists: a session is a normal Claude Code session, with the
+    # user's own settings and permission mode.
+    flags = ["--model", model]
     for d in add_dirs:
-        cmd += ["--add-dir", str(d)]
-    if json_schema is not None:
-        cmd += ["--json-schema", json.dumps(json_schema)]
-    if budget_usd:
-        cmd += ["--max-budget-usd", str(budget_usd)]
+        flags += ["--add-dir", str(d)]
+    return flags
 
-    proc = subprocess.run(cmd, input=prompt, cwd=cwd, capture_output=True, text=True)
-    if log_path:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(proc.stdout + ("\n--- stderr ---\n" + proc.stderr if proc.stderr else ""))
+
+def hook_settings(cfg: Config, kind: str, target: str) -> str:
+    """`--settings` JSON that makes Claude Code call `wbl hook KIND TARGET` (see cmd_hook)."""
+    cmd = shlex.join([sys.executable, str(HERE / "wbl.py"), "--root", str(cfg.root), "hook", kind, target])
+    events = ["Stop", "SessionEnd", *(["UserPromptSubmit"] if kind == "do" else [])]
+    return json.dumps({"hooks": {e: [{"hooks": [{"type": "command", "command": cmd}]}] for e in events}})
+
+
+def agent_command(cfg: Config, kind: str, target: str, *, session: str,
+                  resume: bool = False) -> tuple[list[str], Path, Path | None]:
+    """The `claude` command line for one agent run, the directory to run it in, and the Python
+    venv to activate for it. `kind` is "prep" (target "project/file") or "do" (target a ticket ID)."""
+    if kind == "prep":
+        project, image = inbox_file(cfg, target)
+        comps = [c for c in project.components.values() if c.repo.is_dir()]
+        if project.components and not comps:
+            raise WblError(f"none of {project.name}'s repos exist")
+        prompt = triage_prompt(project, image, comps, draft_path(project, session))
+        cwd = comps[0].repo if comps else project.folder
+        venv = comps[0].venv if comps else None
+        flags = claude_flags(
+            model=cfg.triage_model,
+            # The screenshot lives outside the repos, and the other components are siblings.
+            add_dirs=[*([image.parent] if comps else []), *(c.repo for c in comps[1:])])
+    else:
+        t = get_ticket(cfg, target)
+        prompt, cwd, venv = resolve_prompt(cfg, t), workdir(cfg, t), ticket_component(cfg, t).venv
+        flags = claude_flags(
+            model=cfg.resolve_model,
+            add_dirs=[cfg.project(t.project).folder])
+    # The prompt goes first: --add-dir takes several values and would swallow a trailing
+    # positional argument.
+    cmd = [cfg.claude_bin, *(["--resume", session] if resume else [prompt, "--session-id", session]),
+           *flags, "--settings", hook_settings(cfg, kind, target)]
+    return cmd, cwd, venv
+
+
+def venv_env(venv: Path | None) -> dict[str, str] | None:
+    """The environment with `venv` activated, so `python`/`pip` in the session are its own."""
+    if not venv:
+        return None
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONHOME"}
+    return {**env, "VIRTUAL_ENV": str(venv), "PATH": f"{venv / 'bin'}{os.pathsep}{env.get('PATH', '')}"}
+
+
+def find_transcript(session: str) -> Path | None:
+    """Where Claude Code keeps a session's transcript: <config dir>/projects/<cwd, mangled>/<id>.jsonl."""
+    base = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+    return next(base.glob(f"*/{session}.jsonl"), None)
+
+
+def read_transcript(session: str) -> tuple[int, str]:
+    """(tokens the session has used, the agent's last message). Claude Code writes one line per
+    content block, each repeating its message's usage, so usage is counted once per message id."""
+    path = find_transcript(session)
+    usage: dict[str, dict] = {}
+    last_text = ""
+    for line in open(path) if path else []:
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if e.get("type") != "assistant":
+            continue
+        msg = e.get("message") or {}
+        if msg.get("id") and msg.get("usage"):
+            usage[msg["id"]] = msg["usage"]
+        text = "\n\n".join(b.get("text", "") for b in msg.get("content") or []
+                           if isinstance(b, dict) and b.get("type") == "text").strip()
+        if text and not e.get("isSidechain"):
+            last_text = text
+    tokens = sum(u.get(k, 0) or 0 for u in usage.values() for k in
+                 ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+    return tokens, last_text
+
+
+def run_session(cfg: Config, kind: str, target: str, session: str, *, resume: bool = False) -> None:
+    """Run one agent session to its end, then make sure its outcome is on the board."""
+    cmd, cwd, venv = agent_command(cfg, kind, target, session=session, resume=resume)
     try:
-        out = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        msg = (proc.stderr or proc.stdout).strip()[-2000:]
-        return AgentResult(False, f"claude exited {proc.returncode}: {msg}", None, "", 0, 0.0)
-
-    # Count every model the session touched (Claude Code may use a small model for side tasks).
-    tokens = 0
-    for usage in (out.get("modelUsage") or {}).values():
-        tokens += sum(usage.get(k, 0) for k in
-                      ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"))
-    # Calls the agent tried but the allowlist refused. Worth surfacing: a recurring one means
-    # resolve_allowed_tools in wbl.toml should probably include it.
-    denied = []
-    for d in out.get("permission_denials") or []:
-        inp = d.get("tool_input") or {}
-        detail = inp.get("command") or inp.get("file_path") or ""
-        denied.append(f"{d.get('tool_name', '?')}: {detail.splitlines()[0][:120] if detail else ''}")
-    return AgentResult(
-        denied=denied,
-        ok=not out.get("is_error") and out.get("subtype") == "success",
-        text=out.get("result") or out.get("subtype", ""),
-        structured=out.get("structured_output"),
-        session=out.get("session_id", ""),
-        tokens=tokens,
-        cost_usd=round(float(out.get("total_cost_usd") or 0), 4),
-    )
+        code = subprocess.run(cmd, cwd=cwd, env=venv_env(venv)).returncode
+    except OSError as e:
+        code = f"could not start {cfg.claude_bin}: {e}"
+    if kind == "prep":
+        prep_ended(cfg, target, session)
+    else:
+        do_ended(cfg, target, session, code)
 
 
 # ----------------------------------------------------------------------------------------------
-# Layer 1: triage (screenshot -> spec, priority, points)
+# Layer 1: prep / triage (screenshot -> spec, priority, points)
 # ----------------------------------------------------------------------------------------------
 
-def triage_schema(components: list[str]) -> dict:
-    schema = {
-        "type": "object",
-        "properties": {
-            "title": {"type": "string", "description": "Short imperative ticket title, under 80 chars"},
-            "component": {"type": "string", "enum": components,
-                          "description": "The repo where the fix belongs"},
-            "priority": {"type": "string", "enum": list(PRIORITIES)},
-            "points": {"type": "integer", "enum": list(POINTS)},
-            "spec": {"type": "string", "description": "The ticket body in markdown"},
-        },
-        "required": ["title", "component", "priority", "points", "spec"],
-    }
-    if not components:  # a project with no repo
-        del schema["properties"]["component"]
-        schema["required"].remove("component")
-    return schema
+def inbox_file(cfg: Config, item: str) -> tuple[Project, Path]:
+    """"project/file name" -> (project, path), for a file directly inside a project folder."""
+    name, _, file = item.partition("/")
+    project = cfg.project(name)
+    if not file or "/" in file or Path(file).suffix.lower() not in INPUT_EXTS:
+        raise WblError(f"not a project input: {item}")
+    return project, project.folder / file
+
+
+def prepping(cfg: Config) -> set[str]:
+    """The "project/file" items being prepped right now: one marker file each in .wbl/prepping/,
+    holding the session ID, made when Prep starts and removed when it ends."""
+    return {nfc(f"{p.name}/{f.name}") for p in cfg.projects.values()
+            for f in (p.state_dir / "prepping").glob("*") if f.is_file()}
+
+
+def claim_prep(cfg: Config, items: list[str]) -> dict[str, str]:
+    """Mark inbox items as being prepped, so two runs never ticket the same screenshot, and give
+    each its session ID. Returns {item: session}."""
+    waiting = {nfc(f"{p.name}/{f.name}") for p, f in inbox(cfg)}
+    claimed: dict[str, str] = {}
+    try:
+        for item in items:
+            project, image = inbox_file(cfg, item)
+            if nfc(item) not in waiting:
+                raise WblError(f"not in the inbox: {item}")
+            marker = project.state_dir / "prepping" / image.name
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                raise WblError(f"{item} is already being prepped")
+            claimed[item] = str(uuid.uuid4())
+            with os.fdopen(fd, "w") as fh:
+                fh.write(claimed[item])
+    except WblError:
+        for item in claimed:
+            release_prep(cfg, item)
+        raise
+    return claimed
+
+
+def release_prep(cfg: Config, item: str) -> None:
+    project, image = inbox_file(cfg, item)
+    (project.state_dir / "prepping" / image.name).unlink(missing_ok=True)
+
+
+def prep_session_of(cfg: Config, item: str) -> str:
+    project, image = inbox_file(cfg, item)
+    marker = project.state_dir / "prepping" / image.name
+    if marker.exists():
+        return marker.read_text().strip()
+    t = ticket_for_image(cfg, item)
+    if t and t.prep_session:
+        return t.prep_session
+    raise WblError(f"{item} has no prep session")
+
+
+def ticket_for_image(cfg: Config, item: str) -> Ticket | None:
+    project, image = inbox_file(cfg, item)
+    return next((t for t in load_tickets(cfg, project.name) if nfc(t.image) == nfc(image.name)), None)
+
 
 # The parts of TRIAGE_PROMPT that depend on whether the project has code to look at.
 TRIAGE_WITH_REPOS = dict(
     code_context="""The project consists of these git repositories ("components"):
 {components}
 The current directory is the first of them. Read, Glob and Grep work in all of them;
-`git log` / `git show` only in the current directory.""",
+`git log` / `git show` only in the current directory.{venvs}""",
     explore="Then explore the repositories until you can point at the specific code involved.",
     component_line="""- component: the one repository where the change should be made. If it spans several, pick
   the main one and say in the spec what the others need.
 """,
-    relevant="## Relevant code           (file paths with line numbers, and what each does)",
+    where="file paths with line numbers",
 )
 TRIAGE_WITHOUT_REPOS = dict(
     code_context="""This project has no code repository: it collects miscellaneous tasks (accounts, hosting,
 services, chores). Work from the input and the hint alone; there is no code to look at.""",
     explore="Then work out what has to be done, by whom or where, and in what order.",
     component_line="",
-    relevant="## Relevant context        (services, accounts, tools or sites involved)",
+    where="the services, accounts or sites involved",
 )
 
 TRIAGE_PROMPT = """\
@@ -524,9 +588,17 @@ The only input is one file and its context:
 - Project folder: {project}
 
 Work out what the author wants: a bug to fix, a feature, a UI change, a wording fix, etc.
-{explore} Do not change anything; you are only writing the ticket.
+{explore} Your job is the ticket, not the fix: leave the repositories as they are. Scratch
+files and experiments in a temporary directory are fine.
 
-Return:
+If the work depends on something outside the code (an external API, SDK, library or service),
+research it now rather than leaving it to the implementer: read the docs, inspect the installed
+package or download it and read its source, and try it out. Put what you verified in the spec.
+
+Do everything you can on your own. If you need something from the author (a decision, access, a
+key, a file), stop and ask for the minimum: a short list of just the next things you need.
+
+Work out:
 - title: a short imperative title.
 {component_line}- priority, using this rubric:
     P0  broken or wrong output, data loss, or blocks normal use
@@ -540,110 +612,142 @@ Return:
     5   touches several modules, or needs new tests
     8   substantial feature or refactor
     13  too big for one pass; say how to split it
-- spec: markdown with exactly these sections:
-    ## What the input shows
-    ## Interpretation          (what the author is asking for, and how sure you are)
-    {relevant}
-    ## Proposed fix            (concrete steps an agent could follow)
-    ## Acceptance criteria     (checkable bullets)
-    ## Estimate rationale      (one or two lines justifying priority and points)
+- spec: a short markdown ticket the author will read and edit, with these sections:
+    ## Problem          (two or three sentences: what the input shows and what the author wants)
+    ## Fix              (a few concrete steps, citing {where})
+    ## Done when        (two to four checkable bullets)
+    ## Notes            (only if needed: facts you verified outside the code, open questions)
+  Be terse: no restating the input at length, no estimate rationale, no padding. Aim for
+  under 200 words.
+
+Write the ticket to {draft} (wbl files it on the board from there each time you finish a
+reply), in exactly this form: these lines, a blank line, then the spec.
+title: ...
+{component_key}priority: P1
+points: 3
+
+## Problem
+...
+If the author asks for changes, update that file. Don't repeat the ticket in your messages:
+end with one or two sentences on what it asks for, plus your short list of asks if you have any.
 """
 
 
-def triage_one(cfg: Config, project: Project, image: Path) -> Ticket | None:
-    hint = image.stem.replace("-", " ").replace("_", " ")
-    comps = [c for c in project.components.values() if c.repo.is_dir()]
-    if project.components and not comps:
-        print(f"  ! {project.name}/{image.name}: none of the project's repos exist; skipping")
-        return None
+def triage_prompt(project: Project, image: Path, comps: list[Component], draft: Path) -> str:
     if comps:
-        listing = "\n".join(f"- {c.name}: {c.repo}" for c in comps)
+        listing = "\n".join(f"- {c.name}: {c.repo}" + (f" (Python venv: {c.venv})" if c.venv else "")
+                            for c in comps)
+        venvs = ("\nTo run Python for a repository, use its venv's interpreter (`<venv>/bin/python`), which\n"
+                 "has that repository's packages installed." if any(c.venv for c in comps) else "")
+        if comps[0].venv:
+            venvs += " The first repository's venv is active, so plain `python` and `pip` are its."
         parts = {**TRIAGE_WITH_REPOS,
-                 "code_context": TRIAGE_WITH_REPOS["code_context"].format(components=listing)}
+                 "code_context": TRIAGE_WITH_REPOS["code_context"].format(components=listing, venvs=venvs)}
     else:
         parts = TRIAGE_WITHOUT_REPOS
-    res = run_claude(
-        cfg,
-        TRIAGE_PROMPT.format(project=project.name, image=image, hint=hint, **parts,
-                             kind={"image": "a screenshot", "text": "a text note",
-                                   "pdf": "a PDF"}[input_kind(image.name)]),
-        # Without a repo, the agent runs in the project folder, next to the screenshot.
-        cwd=comps[0].repo if comps else project.folder,
-        model=cfg.triage_model,
-        # Read-only: look at the image and the code, peek at git history, nothing else.
-        allowed=["Read", "Glob", "Grep", "Bash(git log:*)", "Bash(git show:*)", "Bash(ls:*)"],
-        disallowed=["Edit", "Write", "NotebookEdit"],
-        # The screenshot lives outside the repos, and the other components are siblings.
-        add_dirs=[*([image.parent] if comps else []), *(c.repo for c in comps[1:])],
-        json_schema=triage_schema([c.name for c in comps]),
-        budget_usd=cfg.triage_budget_usd,
-        log_path=project.state_dir / "logs" / f"triage-{image.stem}.json",
-    )
-    if not res.ok or not res.structured:
-        print(f"  ! {project.name}/{image.name}: triage failed: {res.text[:300]}")
-        return None
+    return TRIAGE_PROMPT.format(
+        project=project.name, image=image, hint=image.stem.replace("-", " ").replace("_", " "), **parts,
+        draft=draft, component_key="component: ...\n" if comps else "",
+        kind={"image": "a screenshot", "text": "a text note", "pdf": "a PDF"}[input_kind(image.name)])
 
-    s = res.structured
-    t = Ticket(
-        id=allocate_id(project),
-        project=project.name,
-        component=(s["component"] if s.get("component") in project.components else comps[0].name) if comps else "",
-        title=s["title"].strip(),
-        status="pending",
-        priority=s["priority"] if s["priority"] in PRIORITIES else "P1",
-        points=s["points"] if s["points"] in POINTS else 3,
-        image=image.name,
-        created=datetime.now().isoformat(timespec="minutes"),
-        prep_tokens=res.tokens,
-        prep_cost_usd=res.cost_usd,
-        body=s["spec"],
-    )
-    t.path = project.state_dir / f"{t.id}.md"
+
+def draft_path(project: Project, session: str) -> Path:
+    """Where a Prep session writes its ticket (see TRIAGE_PROMPT)."""
+    return project.state_dir / "drafts" / f"{session}.md"
+
+
+def parse_draft(text: str, project: Project) -> dict:
+    """The ticket fields from a Prep draft ("key: value" lines, a blank line, the spec), checked."""
+    head, _, spec = text.strip().partition("\n\n")
+    s = {k.strip().lower(): v.strip() for k, sep, v in (line.partition(":") for line in head.splitlines()) if sep}
+    s["spec"] = spec
+    s["points"] = int(s["points"]) if s.get("points", "").isdigit() else None
+    comps = [c for c in project.components.values() if c.repo.is_dir()]
+    problems = [f"{k} is missing" for k in ("title", "spec") if not str(s.get(k) or "").strip()]
+    if s.get("priority") not in PRIORITIES:
+        problems.append(f"priority must be one of {', '.join(PRIORITIES)}")
+    if s.get("points") not in POINTS:
+        problems.append(f"points must be one of {', '.join(map(str, POINTS))}")
+    if comps and s.get("component") not in project.components:
+        problems.append(f"component must be one of {', '.join(c.name for c in comps)}")
+    if problems:
+        raise WblError("; ".join(problems))
+    return s
+
+
+def file_ticket(cfg: Config, item: str, session: str) -> Ticket | None:
+    """Create the ticket from a Prep session's draft, or update it if the draft changed since it
+    was last filed (you asked for changes; an unchanged draft leaves your edits on the board
+    alone). Returns None if there's nothing new; raises WblError if the draft isn't valid."""
+    project, image = inbox_file(cfg, item)
+    draft = draft_path(project, session)
+    filed = draft.with_suffix(".filed")
+    text = draft.read_text() if draft.exists() else ""
+    if not text.strip() or (filed.exists() and filed.read_text() == text):
+        return None
+    s = parse_draft(text, project)
+    tokens, _ = read_transcript(session)
+    t = next((x for x in load_tickets(cfg, project.name) if x.prep_session == session), None)
+    if t is None:
+        t = Ticket(id=allocate_id(project), project=project.name, title="", status="pending",
+                   priority="P1", points=3, image=image.name,
+                   created=datetime.now().isoformat(timespec="minutes"), prep_session=session)
+        t.path = project.state_dir / f"{t.id}.md"
+    if not t.worktree and t.status == "pending":
+        t.component = s.get("component", "")  # a later Do pins it, after which it can't move
+    t.title, t.priority, t.points = s["title"].strip(), s["priority"], s["points"]
+    # Replace the spec but keep any Do reports below it.
+    reports = t.body.find("\n\n## Resolution")
+    t.body = s["spec"].strip() + (t.body[reports:] if reports >= 0 else "")
+    t.prep_tokens, t.prep_cost_usd = tokens, None
     t.save()
-    # Rename the triage log to the ticket ID so `done` can find and remove it.
-    log = project.state_dir / "logs" / f"triage-{image.stem}.json"
-    if log.exists():
-        log.rename(project.state_dir / "logs" / f"{t.id}-triage.json")
-    where = f" ({t.component})" if len(project.components) > 1 else ""
-    print(f"  + {t.id}{where} [{t.priority} · {t.points}pt] {t.title}  (${res.cost_usd:.2f})")
+    filed.write_text(text)
+    release_prep(cfg, item)
     return t
 
 
-def cmd_triage(cfg: Config, args: argparse.Namespace) -> None:
-    """Triage specific screenshots, given as "<project>/<file name>". Launched by the server."""
-    wanted = {nfc(i) for i in args.images}
-    items = [(p, f) for p, f in inbox(cfg) if nfc(f"{p.name}/{f.name}") in wanted]
-    missing = wanted - {nfc(f"{p.name}/{f.name}") for p, f in items}
-    if missing:
-        raise WblError(f"not in the inbox: {', '.join(sorted(missing))}")
-    print(f"triaging {len(items)} screenshot(s), {cfg.max_parallel} at a time")
-    with ThreadPoolExecutor(max_workers=cfg.max_parallel) as pool:
-        list(pool.map(lambda pf: triage_one(cfg, *pf), items))
+def prep_ended(cfg: Config, item: str, session: str) -> None:
+    """After a Prep session: file the ticket if no hook did, then clear the draft and free the
+    screenshot (without a ticket, it goes back to the inbox)."""
+    project, _ = inbox_file(cfg, item)
+    try:
+        file_ticket(cfg, item, session)
+    except WblError:
+        pass
+    draft = draft_path(project, session)
+    draft.unlink(missing_ok=True)
+    draft.with_suffix(".filed").unlink(missing_ok=True)
+    release_prep(cfg, item)
 
 
 # ----------------------------------------------------------------------------------------------
-# Layer 2: resolve (spec -> branch with a proposed fix)
+# Layer 2: do / resolve (spec -> uncommitted changes in your checkout)
 # ----------------------------------------------------------------------------------------------
 
 RESOLVE_PROMPT = """\
 You are implementing ticket {id} in the project "{project}".
-The current directory is a git worktree on branch {branch}, made just for this ticket.
-Stay inside it. Do not commit, push, or switch branches: the author reviews your changes
-uncommitted and commits them himself.
+The current directory is the project's git repository, on the branch the author has checked
+out. Work there: the author manages branches and commits, and reviews your changes
+uncommitted. The checkout may already hold uncommitted changes of the author's; leave those
+alone.
 
 The original input (a screenshot, note or PDF) is at {image} if you want to look at it.
-
+{venv}
 # {title}
 
 {spec}
 
 Instructions:
-1. Re-check the relevant code; the spec was written by a quick read-only pass and may be off.
-2. Make the change. Keep it focused on this ticket; match the surrounding code style and
+1. Re-check the relevant code; the spec may be off.
+2. If the change depends on an external API, SDK or library, verify it (docs, the installed
+   package's source, a quick experiment) rather than writing code from guesses.
+3. Make the change. Keep it focused on this ticket; match the surrounding code style and
    document what you add.
-3. If the repo has tests, run the relevant ones, and add a test when the fix is testable.
-4. Finish with a short report in markdown: what you changed (files), how you verified it, and
-   anything left undone or uncertain. That report is appended to the ticket verbatim.
+4. If the repo has tests, run the relevant ones, and add a test when the fix is testable.
+5. Do everything you can on your own, then stop and check in. End with a short report in
+   markdown: what you changed (files) and how you verified it, then, if anything is left, the
+   minimum you need from the author next, as a short list. Your last message goes on the
+   ticket verbatim.
 """
 
 
@@ -651,115 +755,219 @@ def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
     return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=check)
 
 
-def prepare_worktree(cfg: Config, t: Ticket) -> None:
-    """Give the ticket its own branch wbl/<ID> checked out in its own worktree.
-
-    Worktrees (rather than branches in the main checkout) are what make parallel agents safe:
-    each one has a separate directory, so two agents on the same repo never see each other's
-    half-done edits, and your own checkout is never touched. Re-running resolve on a ticket
-    reuses its existing worktree, so a second attempt builds on the first.
-    """
-    c = ticket_component(cfg, t)
-    branch = f"wbl/{t.id}"
-    wt = cfg.worktree_root / t.project / t.id
-    if not wt.exists():
-        wt.parent.mkdir(parents=True, exist_ok=True)
-        has_branch = git(c.repo, "rev-parse", "--verify", "--quiet", branch, check=False).returncode == 0
-        args = ["worktree", "add", str(wt), branch] if has_branch else \
-               ["worktree", "add", "-b", branch, str(wt), c.base]
-        r = git(c.repo, *args, check=False)
-        if r.returncode:
-            raise WblError(f"{t.id}: git worktree add failed: {r.stderr.strip()}")
-    t.branch, t.worktree = branch, str(wt)
-    t.component = c.name  # pin it, so a later config change can't point the ticket elsewhere
+def workdir(cfg: Config, t: Ticket) -> Path:
+    """Where Do runs for this ticket: the component's checkout (or, for a ticket from before Do
+    worked in place, the separate worktree it still has)."""
+    return Path(t.worktree) if t.worktree and Path(t.worktree).exists() else ticket_component(cfg, t).repo
 
 
-def resolve_one(cfg: Config, t: Ticket) -> Ticket:
+def resolve_prompt(cfg: Config, t: Ticket) -> str:
     p = cfg.project(t.project)
     name = p.name if len(p.components) == 1 else f"{p.name}/{t.component}"
-    res = run_claude(
-        cfg,
-        RESOLVE_PROMPT.format(id=t.id, project=name, branch=t.branch, title=t.title,
-                              spec=t.body, image=p.folder / t.image),
-        cwd=Path(t.worktree),
-        model=cfg.resolve_model,
-        allowed=cfg.resolve_allowed_tools,
-        disallowed=cfg.resolve_disallowed_tools,
-        permission_mode="acceptEdits",  # file edits inside the worktree go through without prompting
-        add_dirs=[p.folder],
-        budget_usd=cfg.resolve_budget_usd,
-        log_path=p.state_dir / "logs" / f"{t.id}-resolve.json",
-    )
-    # Re-read from disk before writing: you may have changed priority/points in the UI meanwhile.
+    spec = t.body.split("\n\n## Resolution")[0]  # earlier reports live in the session, if resumed
+    venv = ticket_component(cfg, t).venv
+    venv = (f"\nThe repository's Python venv, {venv}, is active: `python` and `pip` are its, and it has\n"
+            "the project's packages installed. Use it; don't create another environment.\n") if venv else ""
+    return RESOLVE_PROMPT.format(id=t.id, project=name, title=t.title, spec=spec,
+                                 image=p.folder / t.image, venv=venv)
+
+
+# The server handles requests on several threads; two quick clicks must not both pass the
+# "one ticket per repo" check before either has marked its ticket in_progress.
+_claim_lock = threading.Lock()
+
+
+def claim_do(cfg: Config, ids: list[str], resume: bool = False) -> list[Ticket]:
+    """Mark tickets in_progress before their sessions start, refusing any that would share a
+    checkout with a running one (or with each other). Gives each a new session ID, unless
+    `resume`. Pins each ticket's component, so a later config change can't point it elsewhere."""
+    with _claim_lock:
+        tickets = [get_ticket(cfg, i) for i in ids]
+        busy = {str(workdir(cfg, o)): o.id for o in load_tickets(cfg) if o.status == "in_progress"}
+        for t in tickets:
+            if t.status == "in_progress":
+                raise WblError(f"{t.id} is already in progress")
+            t.component = ticket_component(cfg, t).name  # also fails for a project without a repo
+            if resume and not (t.session and find_transcript(t.session)):
+                raise WblError(f"{t.id} has no earlier session to continue")
+            where = str(workdir(cfg, t))
+            if where in busy:
+                raise WblError(f"{busy[where]} is already being worked on in {where}; "
+                               f"wait for it to finish before starting {t.id}")
+            busy[where] = t.id
+        for t in tickets:
+            t.status = "in_progress"
+            if not resume:
+                t.session = str(uuid.uuid4())  # chosen up front, so the board can show it right away
+            t.save()
+        return tickets
+
+
+def record_report(t: Ticket, session: str, text: str, ok: bool = True) -> Ticket:
+    """Put a Do session's latest outcome on the ticket. Each session has one report section,
+    replaced each time the agent finishes a turn. Re-reads the ticket first: you may have
+    changed priority/points in the UI meanwhile."""
     fresh = Ticket.load(t.path)
-    fresh.branch, fresh.worktree = t.branch, t.worktree
-    fresh.status = "review" if res.ok else "failed"
-    fresh.session = res.session or fresh.session
-    fresh.tokens, fresh.cost_usd = res.tokens, res.cost_usd
+    tokens, _ = read_transcript(session)
+    fresh.status = "review" if ok else "failed"
+    fresh.tokens, fresh.cost_usd = tokens, None
+    mark = f"session {session[:8]}"
+    m = re.search(rf"\n\n## Resolution[^\n]*{mark}", fresh.body)
+    if m:  # drop this session's previous report
+        nxt = fresh.body.find("\n\n## Resolution", m.end())
+        fresh.body = fresh.body[:m.start()] + (fresh.body[nxt:] if nxt >= 0 else "")
     stamp = datetime.now().isoformat(timespec="minutes")
-    fresh.body += (f"\n\n## Resolution attempt — {stamp} ({fresh.status}, "
-                   f"{res.tokens:,} tokens, ${res.cost_usd:.2f})\n\n{res.text.strip()}")
-    if res.denied:
-        fresh.body += "\n\n**Blocked tool calls** (consider widening `resolve_allowed_tools`):\n" + \
-                      "\n".join(f"- `{d}`" for d in res.denied)
+    fresh.body += f"\n\n## Resolution — {stamp} ({fresh.status}, {tokens:,} tokens, {mark})\n\n{text.strip()}"
     fresh.save()
-    print(f"  {'✓' if res.ok else '✗'} {t.id} -> {fresh.status}  ({res.tokens:,} tok, ${res.cost_usd:.2f})")
     return fresh
 
 
-def cmd_resolve(cfg: Config, args: argparse.Namespace) -> None:
-    """Resolve the given tickets in parallel. Launched by the server."""
-    tickets = [get_ticket(cfg, i) for i in args.ids]
-    for t in tickets:
-        if t.status == "in_progress":
-            raise WblError(f"{t.id} is already in progress")
+def do_ended(cfg: Config, ticket_id: str, session: str, code) -> None:
+    """After a Do session: if no hook recorded an outcome, record one from the transcript."""
+    t = get_ticket(cfg, ticket_id)
+    if t.status != "in_progress" or t.session != session:
+        return
+    _, text = read_transcript(session)
+    record_report(t, session, text or f"(the session ended before Claude reported; exit status {code})",
+                  ok=bool(text))
 
-    # Worktree creation is done one at a time: concurrent `git worktree add` on the same repo
-    # can trip over git's lock files. The agents themselves then run in parallel.
-    for t in tickets:
-        prepare_worktree(cfg, t)
+
+# ----------------------------------------------------------------------------------------------
+# Sessions in a terminal window, and the hooks Claude Code calls
+# ----------------------------------------------------------------------------------------------
+
+def open_terminal(cfg: Config, command: list[str], cwd: Path) -> None:
+    """Run `command` in a new terminal window (cfg.terminal) and return straight away. The
+    window's process is not ours: it lives on after the server stops."""
+    shell_cmd = f"cd {shlex.quote(str(cwd))} && {shlex.join(command)}"
+    if isinstance(cfg.terminal, list):
+        argv = [a.replace("{cmd}", shell_cmd) for a in cfg.terminal]
+        subprocess.Popen(argv, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
+    quoted = '"' + shell_cmd.replace("\\", "\\\\").replace('"', '\\"') + '"'  # an AppleScript string
+    if cfg.terminal == "Terminal":
+        script = f'tell application "Terminal"\nactivate\ndo script {quoted}\nend tell'
+    elif cfg.terminal == "iTerm":
+        script = ('tell application "iTerm"\nactivate\nset w to (create window with default profile)\n'
+                  f'tell current session of w to write text {quoted}\nend tell')
+    else:
+        raise WblError(f'terminal must be "Terminal", "iTerm" or an argv list with "{{cmd}}", not {cfg.terminal!r}')
+    try:
+        r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise WblError(f"could not open {cfg.terminal}: {e}")
+    if r.returncode:
+        # The usual cause: macOS hasn't been allowed to let this process control the terminal app
+        # (System Settings > Privacy & Security > Automation).
+        raise WblError(f"could not open {cfg.terminal}: {r.stderr.strip()}")
+
+
+def open_session(cfg: Config, kind: str, target: str, resume: bool = False) -> None:
+    """Open a terminal window running `wbl session KIND TARGET`: an interactive agent session."""
+    cmd = [sys.executable, str(HERE / "wbl.py"), "--root", str(cfg.root), "session", kind, target,
+           *(["--resume"] if resume else [])]
+    open_terminal(cfg, cmd, cfg.root)
+
+
+def start_prep(cfg: Config, items: list[str]) -> None:
+    """Prep in terminal windows, one per item."""
+    claim_prep(cfg, items)
+    for n, item in enumerate(items):
+        try:
+            open_session(cfg, "prep", item)
+        except WblError:
+            for rest in items[n:]:
+                release_prep(cfg, rest)
+            raise
+
+
+def start_do(cfg: Config, ids: list[str], resume: bool = False) -> None:
+    """Do in terminal windows, one per ticket. `resume` continues each ticket's last session."""
+    tickets = claim_do(cfg, ids, resume=resume)
+    for n, t in enumerate(tickets):
+        try:
+            open_session(cfg, "do", t.id, resume=resume)
+        except WblError:
+            for rest in tickets[n:]:
+                rest = get_ticket(cfg, rest.id)
+                rest.status = "review" if rest.tokens else "pending"
+                rest.save()
+            raise
+
+
+def cmd_session(cfg: Config, args: argparse.Namespace) -> None:
+    """The process inside a terminal window: one interactive agent session."""
+    if args.kind == "prep":
+        session = prep_session_of(cfg, args.target)
+        title, what = args.target, "When Claude has written the ticket, it shows up on the board"
+    else:
+        t = get_ticket(cfg, args.target)
+        if t.status != "in_progress" or not t.session:
+            raise WblError(f"{t.id} wasn't started from the board (status {t.status}); use Do there")
+        session, title = t.session, f"{t.id} {t.title}"
+        here = workdir(cfg, t)
+        branch = git(here, "branch", "--show-current", check=False).stdout.strip() or "detached HEAD"
+        what = f"Working in {here} (on {branch}; nothing gets committed). Claude's report shows up on the board"
+    print(f"\033]0;wbl: {title}\007", end="")  # window title
+    print(f"{title}\n{what} each time it finishes. Stay to follow up, or quit (/exit) whenever.\n", flush=True)
+    # Closing the window hangs up (SIGHUP) on claude and on us. We catch it, rather than ignore
+    # it, so that claude (which execs with default handlers) still exits while we stay long
+    # enough to record the outcome. Ctrl-C belongs to claude (it interrupts the agent), not us.
+    for sig in (signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, lambda *_: None)
+    run_session(cfg, args.kind, args.target, session, resume=args.resume)
+    try:
+        print("\nRecorded on the board. You can close this window.", flush=True)
+    except OSError:  # the window is already gone
+        pass
+
+
+def cmd_hook(cfg: Config, args: argparse.Namespace) -> None:
+    """Called by Claude Code (hook_settings) with the event as JSON on stdin.
+
+    Stop (the agent finished a turn): Prep files or updates the ticket from its draft;
+    Do records the report and moves the ticket to Review. UserPromptSubmit (you asked a Do
+    session for more): back to In progress. SessionEnd: Prep frees the screenshot, Do records
+    whatever it has if nothing has yet."""
+    event = json.load(sys.stdin)
+    name, session = event.get("hook_event_name"), event.get("session_id", "")
+    if args.kind == "prep":
+        if name == "Stop":
+            try:
+                file_ticket(cfg, args.target, session)
+            except WblError:
+                pass  # a half-written draft (say, Claude asked you something first); try next turn
+        elif name == "SessionEnd":
+            prep_ended(cfg, args.target, session)
+        return
+    # Claude Code hands Stop hooks the final message; the transcript may not have it yet.
+    text = event.get("last_assistant_message") or read_transcript(session)[1]
+    t = get_ticket(cfg, args.target)
+    if t.session != session:
+        return  # not the ticket's current session (say, an old one reopened by hand)
+    if name == "Stop":
+        record_report(t, session, text or "(Claude finished without a message)", ok=bool(text))
+    elif name == "UserPromptSubmit" and t.status != "in_progress":
         t.status = "in_progress"
         t.save()
-    print(f"resolving {len(tickets)} ticket(s), {cfg.max_parallel} at a time")
-    with ThreadPoolExecutor(max_workers=cfg.max_parallel) as pool:
-        list(pool.map(lambda t: resolve_one(cfg, t), tickets))
+    elif name == "SessionEnd":
+        do_ended(cfg, t.id, session, "session ended")
 
 
 # ----------------------------------------------------------------------------------------------
 # Finishing: cleanup
 # ----------------------------------------------------------------------------------------------
 
-def worktree_changes(cfg: Config, t: Ticket) -> str:
-    """Everything the ticket's branch adds on top of its base: commits (if you made any) plus
-    the uncommitted edits the agent left, as `git status` and a diff. Used for review."""
-    wt = Path(t.worktree) if t.worktree else None
-    if not wt or not wt.exists():
-        return ""
-    c = ticket_component(cfg, t)
-    base = git(c.repo, "rev-parse", c.base, check=False).stdout.strip()
-    status = git(wt, "status", "--short", check=False).stdout
-    commits = git(wt, "log", "--oneline", f"{base}..HEAD", check=False).stdout if base else ""
-    diff = git(wt, "diff", base or "HEAD", check=False).stdout  # base -> working tree (tracked files)
-    # New files the agent created don't appear in `git diff` until added. Rather than touch the
-    # worktree's index, diff each one against /dev/null (respecting .gitignore).
-    untracked = git(wt, "ls-files", "--others", "--exclude-standard", check=False).stdout.split("\n")
-    for f in filter(None, untracked):
-        diff += git(wt, "diff", "--no-index", "--", "/dev/null", f, check=False).stdout
-    out = status
-    if commits.strip():
-        out += "\n# commits on branch\n" + commits
-    return (out + "\n" + diff)[:300_000]
-
-
 def finish_ticket(cfg: Config, t: Ticket, force: bool = False, keep_image: bool = False) -> list[str]:
-    """Remove every trace of a ticket: worktree, branch (if merged), screenshot, ticket, logs.
+    """Remove every trace of a ticket: screenshot, ticket, and for a ticket from before Do
+    worked in your checkout, its worktree and branch (if merged). Your checkout is not touched.
 
     `keep_image` is "discard": the ticket goes, but the screenshot stays and so drops back into
     the inbox, ready to be prepped again (say, after renaming it).
 
     Safety rails, which `force` overrides (use it for won't-fix / throw-away):
       * a ticket whose agent is still running is left alone;
-      * a worktree with uncommitted changes is not removed, since that work would be lost;
+      * an old-style worktree with uncommitted changes is not removed, since that work would be lost;
       * a branch that is not merged is kept (`git branch -d` refuses) and we say so.
     """
     p = cfg.project(t.project)
@@ -786,7 +994,7 @@ def finish_ticket(cfg: Config, t: Ticket, force: bool = False, keep_image: bool 
         elif "not found" not in r.stderr:
             notes.append(f"kept branch {t.branch} (not merged; delete it yourself if unwanted)")
 
-    doomed = [t.path, *p.state_dir.glob(f"logs/{t.id}-*")]
+    doomed = [t.path, *p.state_dir.glob(f"logs/{t.id}-*")]  # logs: only old tickets have them
     if not keep_image:
         doomed += [p.folder / t.image, p.state_dir / "thumbs" / f"{t.image}.png"]
     for f in doomed:
@@ -797,17 +1005,17 @@ def finish_ticket(cfg: Config, t: Ticket, force: bool = False, keep_image: bool 
 
 
 def set_component(cfg: Config, t: Ticket, name: str) -> None:
-    """Move a ticket to another of its project's repos (triage guessed wrong). Only before
-    resolve: once a worktree exists, its branch lives in the old repo."""
+    """Move a ticket to another of its project's repos (triage guessed wrong). Not while an
+    agent works on it, nor for an old-style ticket whose branch lives in the old repo."""
     c = cfg.project(t.project).component(name)
-    if t.worktree and c.name != t.component:
-        raise WblError(f"{t.id} already has a worktree in {t.component}; finish it first")
+    if c.name != t.component and (t.worktree or t.status == "in_progress"):
+        raise WblError(f"{t.id} is being or was worked on in {t.component}; finish it first")
     t.component = c.name
 
 
 # ----------------------------------------------------------------------------------------------
-# Entry point. Everything is driven from the browser UI (`make run`); `triage` and `resolve`
-# are what the server launches in the background, so agents outlive a server restart.
+# Entry point. Everything is driven from the browser UI (`make run`). `session` is what the server
+# runs in a terminal window, so sessions outlive a server restart; `hook` is what Claude Code calls.
 # ----------------------------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -820,11 +1028,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--port", type=int, default=8765)
     s.add_argument("--open", action="store_true", help="open a browser tab")
 
-    s = sub.add_parser("triage", help="(used by the server) turn screenshots into tickets")
-    s.add_argument("images", nargs="+", help="PROJECT/FILE")
+    s = sub.add_parser("session", help="(used by the server, in a terminal window) one agent session")
+    s.add_argument("kind", choices=["prep", "do"])
+    s.add_argument("target", help="PROJECT/FILE for prep, a ticket ID for do")
+    s.add_argument("--resume", action="store_true", help="continue the ticket's last session")
 
-    s = sub.add_parser("resolve", help="(used by the server) send agents at tickets")
-    s.add_argument("ids", nargs="+")
+    s = sub.add_parser("hook", help="(used by Claude Code) record a session's progress")
+    s.add_argument("kind", choices=["prep", "do"])
+    s.add_argument("target")
     return ap
 
 
@@ -840,7 +1051,7 @@ def main(argv: list[str] | None = None) -> int:
             import wbl_server  # kept in its own module so this one stays readable
             wbl_server.serve(cfg, args.port, args.open)
         else:
-            {"triage": cmd_triage, "resolve": cmd_resolve}[args.cmd](cfg, args)
+            {"session": cmd_session, "hook": cmd_hook}[args.cmd](cfg, args)
     except WblError as e:
         print(f"wbl: {e}", file=sys.stderr)
         return 1

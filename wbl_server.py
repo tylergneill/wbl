@@ -2,12 +2,12 @@
 wbl_server — the local browser front end for the WayBackLog Machine (`wbl serve`).
 
 A small JSON API over the same ticket files the CLI uses, plus one static page (ui.html).
-The page polls /api/state every few seconds, so tickets moved by CLI runs, agents, or edits
-in another tab show up on their own.
+The page polls /api/state every few seconds, so tickets changed by agents (through their hooks)
+or edits in another tab show up on their own.
 
-Long-running work (triage, resolve) is not done inside the server: the API starts the ordinary
-CLI as a background subprocess and logs its output. That keeps one code path for everything,
-and a server restart never kills an agent mid-run.
+Agents never run inside the server: Prep and Do open a terminal window running `wbl session …`,
+an ordinary Claude Code session. That keeps one code path, and a server restart never kills an
+agent mid-run.
 
 Security: it binds to 127.0.0.1 only. Write endpoints insist on `Content-Type: application/json`,
 which a web page on another origin cannot send to us without a CORS preflight that this server
@@ -18,95 +18,32 @@ from __future__ import annotations
 
 import json
 import mimetypes
-import os
-import signal
-import subprocess
-import sys
-import threading
+import shlex
 import webbrowser
-from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import wbl
 
 UI_FILE = Path(__file__).resolve().parent / "ui.html"
 
 
-class Jobs:
-    """Background CLI runs started from the UI ("triage inbox", "resolve selected")."""
-
-    def __init__(self, cfg: wbl.Config):
-        self.cfg = cfg
-        self.log_dir = cfg.worktree_root.parent / "jobs"
-        self.items: list[dict] = []
-        self.next_id = 1
-        self.lock = threading.Lock()
-
-    def start(self, kind: str, cli_args: list[str], claims: set[str] = frozenset()) -> dict:
-        """`claims` (triage only) is the set of "project/image" items the run will take.
-        Two runs claiming the same screenshot would both ticket it."""
-        with self.lock:
-            for j in self.items:
-                if j["proc"].poll() is None and claims & j["claims"]:
-                    raise wbl.WblError("some of those are already being worked on")
-            self.log_dir.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            log = self.log_dir / f"{stamp}-{kind}-{self.next_id}.log"
-            cmd = [sys.executable, str(Path(wbl.__file__).resolve()),
-                   "--root", str(self.cfg.root), kind, *cli_args]
-            # Its own session (and process group), so it survives a server restart and can be
-            # cancelled as a group, agents included.
-            proc = subprocess.Popen(cmd, stdout=open(log, "w"), stderr=subprocess.STDOUT,
-                                    start_new_session=True)
-            job = {"id": self.next_id, "kind": kind, "args": cli_args, "started": stamp,
-                   "log": log, "proc": proc, "claims": claims, "cancelled": False}
-            self.next_id += 1
-            self.items = (self.items + [job])[-10:]
-            return self.describe(job)
-
-    def cancel(self, job_id: int) -> dict:
-        with self.lock:
-            job = next((j for j in self.items if j["id"] == job_id), None)
-            if job is None:
-                raise wbl.WblError(f"no job {job_id}")
-            if job["proc"].poll() is None:
-                try:
-                    os.killpg(job["proc"].pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                job["proc"].wait(timeout=10)
-                job["cancelled"] = True
-        if job["kind"] == "resolve":
-            # The killed run never got to record a result; don't leave its tickets stuck.
-            for i in job["args"]:
-                try:
-                    t = wbl.get_ticket(self.cfg, i)
-                except wbl.WblError:
-                    continue
-                if t.status == "in_progress":
-                    t.status = "failed"
-                    t.body += "\n\n## Resolution attempt cancelled from the UI"
-                    t.save()
-        return self.describe(job)
-
-    @staticmethod
-    def describe(job: dict) -> dict:
-        code = job["proc"].poll()
-        tail = job["log"].read_text()[-1500:] if job["log"].exists() else ""
-        return {"id": job["id"], "kind": job["kind"], "args": job["args"], "started": job["started"],
-                "running": code is None, "exit_code": code, "cancelled": job["cancelled"], "tail": tail}
-
-    def snapshot(self) -> list[dict]:
-        with self.lock:
-            return [self.describe(j) for j in self.items]
+def export_markdown(tickets: list[wbl.Ticket]) -> str:
+    """Tickets as plain markdown, for pasting or saving elsewhere: no frontmatter."""
+    return "\n\n---\n\n".join(
+        f"# {t.title}\n\n{t.id} · {t.project} · {t.priority} · {t.points} pt\n\n{t.body.strip()}\n"
+        for t in tickets)
 
 
-def make_handler(cfg: wbl.Config, jobs: Jobs):
+def make_handler(cfg: wbl.Config):
     def describe_ticket(t: wbl.Ticket) -> dict:
         f = cfg.project(t.project).folder / t.image
         d = t.to_dict()
+        if t.component or len(cfg.project(t.project).components) == 1:
+            where = wbl.workdir(cfg, t)
+            d["workdir"] = str(where)
+            d["resume_cmd"] = f"cd {shlex.quote(str(where))} && claude --resume {t.session}" if t.session else ""
         d["image_missing"] = not f.exists()  # renamed or deleted after Prep
         d["excerpt"] = wbl.text_excerpt(f) if d["kind"] == "text" and f.exists() else ""
         return d
@@ -141,9 +78,10 @@ def make_handler(cfg: wbl.Config, jobs: Jobs):
             return json.loads(self.rfile.read(n) or b"{}")
 
         def route(self, method: str) -> None:
-            parts = [unquote(p) for p in urlparse(self.path).path.strip("/").split("/") if p]
+            url = urlparse(self.path)
+            parts = [unquote(p) for p in url.path.strip("/").split("/") if p]
             try:
-                self.dispatch(method, parts)
+                self.dispatch(method, parts, parse_qs(url.query))
             except wbl.WblError as e:
                 self.send_json({"error": str(e)}, 400)
             except PermissionError as e:
@@ -159,12 +97,13 @@ def make_handler(cfg: wbl.Config, jobs: Jobs):
 
         # --- endpoints --------------------------------------------------------------------
 
-        def dispatch(self, method: str, parts: list[str]) -> None:
+        def dispatch(self, method: str, parts: list[str], query: dict) -> None:
             if method == "GET" and not parts:
                 return self.send_file(UI_FILE, "text/html; charset=utf-8")
 
             if method == "GET" and parts == ["api", "state"]:
                 tickets = wbl.load_tickets(cfg)
+                busy = wbl.prepping(cfg)
                 return self.send_json({
                     "root": str(cfg.root),
                     "projects": [{"name": p.name, "key": p.key, "components": list(p.components),
@@ -174,16 +113,15 @@ def make_handler(cfg: wbl.Config, jobs: Jobs):
                     "tickets": [describe_ticket(t) for t in tickets],
                     "inbox": [{"project": p.name, "image": f.name, "image_url": f"/img/{p.name}/{f.name}",
                                "thumb_url": f"/thumb/{p.name}/{f.name}", "kind": wbl.input_kind(f.name),
-                               "excerpt": wbl.text_excerpt(f) if wbl.input_kind(f.name) == "text" else ""}
+                               "excerpt": wbl.text_excerpt(f) if wbl.input_kind(f.name) == "text" else "",
+                               "prepping": wbl.nfc(f"{p.name}/{f.name}") in busy}
                               for p, f in wbl.inbox(cfg)],
-                    "jobs": jobs.snapshot(),
                     "priorities": wbl.PRIORITIES, "points": wbl.POINTS, "statuses": wbl.STATUSES,
                     # So the UI can say what a click may spend before it starts any agents: the
-                    # per-run limit, plus the token counts past runs on current tickets actually used.
-                    "triage_budget_usd": cfg.triage_budget_usd, "resolve_budget_usd": cfg.resolve_budget_usd,
+                    # token counts past sessions on current tickets actually used.
                     "triage_tokens": [t.prep_tokens for t in tickets if t.prep_tokens],
                     "resolve_tokens": [t.tokens for t in tickets if t.tokens],
-                    "max_parallel": cfg.max_parallel,
+                    "terminal": cfg.terminal if isinstance(cfg.terminal, str) else "your terminal",
                 })
 
             if method == "GET" and len(parts) == 3 and parts[0] in ("img", "thumb"):
@@ -204,8 +142,20 @@ def make_handler(cfg: wbl.Config, jobs: Jobs):
                     raise FileNotFoundError
                 return self.send_file(thumb, "image/png")
 
-            if method == "GET" and len(parts) == 4 and parts[:2] == ["api", "tickets"] and parts[3] == "diff":
-                return self.send_json({"diff": wbl.worktree_changes(cfg, wbl.get_ticket(cfg, parts[2]))})
+            if method == "GET" and parts == ["api", "export"]:
+                # ?ids=SKR-1,SKR-2 -> one markdown file, downloaded.
+                ids = [i for v in query.get("ids", []) for i in v.split(",") if i]
+                if not ids:
+                    raise wbl.WblError("no tickets selected")
+                data = export_markdown([wbl.get_ticket(cfg, i) for i in ids]).encode()
+                name = f"{ids[0].upper()}.md" if len(ids) == 1 else "tickets.md"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/markdown; charset=utf-8")
+                self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(name)}")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
 
             if method == "POST" and len(parts) == 3 and parts[:2] == ["api", "tickets"]:
                 body = self.read_json()
@@ -224,8 +174,10 @@ def make_handler(cfg: wbl.Config, jobs: Jobs):
                     if body["status"] not in wbl.STATUSES:
                         raise wbl.WblError("bad status")
                     t.status = body["status"]
-                if body.get("title", "").strip():
-                    t.title = body["title"].strip()
+                if str(body.get("title", "")).strip():
+                    t.title = str(body["title"]).strip()
+                if "body" in body:
+                    t.body = str(body["body"])
                 t.save()
                 return self.send_json(t.to_dict())
 
@@ -236,29 +188,32 @@ def make_handler(cfg: wbl.Config, jobs: Jobs):
                                           keep_image=parts[3] == "discard")
                 return self.send_json({"notes": notes})
 
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["api", "tickets"] and parts[3] == "continue":
+                # Reopen the ticket's last Do session in a terminal window.
+                self.read_json()  # content-type check: this starts an agent
+                wbl.start_do(cfg, [parts[2]], resume=True)
+                return self.send_json({"opened": [parts[2].upper()]})
+
             if method == "POST" and parts == ["api", "triage"]:
-                # {"images": ["project/file", ...]}
+                # {"images": ["project/file", ...]}: one Prep session window each.
                 images = [str(i) for i in self.read_json().get("images", [])]
                 if not images:
                     raise wbl.WblError("no screenshots selected")
-                return self.send_json(jobs.start("triage", images, claims={wbl.nfc(i) for i in images}))
+                wbl.start_prep(cfg, images)
+                return self.send_json({"opened": images})
 
-            if method == "POST" and len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] == "cancel":
-                self.read_json()  # content-type check: this is a write
-                if not parts[2].isdigit():
-                    raise wbl.WblError("bad job id")
-                return self.send_json(jobs.cancel(int(parts[2])))
+            if method == "POST" and parts == ["api", "unprep"]:
+                # {"image": "project/file"}: forget a Prep whose window died without telling us.
+                wbl.release_prep(cfg, str(self.read_json().get("image", "")))
+                return self.send_json({})
 
             if method == "POST" and parts == ["api", "resolve"]:
+                # {"ids": [...]}: one Do session window each.
                 ids = [str(i) for i in self.read_json().get("ids", [])]
                 if not ids:
                     raise wbl.WblError("no tickets selected")
-                for i in ids:
-                    t = wbl.get_ticket(cfg, i)  # fail fast on a bad ID instead of in the background
-                    if t.status == "in_progress":
-                        raise wbl.WblError(f"{t.id} is already in progress")
-                    wbl.ticket_component(cfg, t)  # a project without a repo has nothing to Do
-                return self.send_json(jobs.start("resolve", ids, claims={i.upper() for i in ids}))
+                wbl.start_do(cfg, ids)
+                return self.send_json({"opened": [i.upper() for i in ids]})
 
             raise FileNotFoundError
 
@@ -266,7 +221,7 @@ def make_handler(cfg: wbl.Config, jobs: Jobs):
 
 
 def serve(cfg: wbl.Config, port: int = 8765, open_browser: bool = False) -> None:
-    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(cfg, Jobs(cfg)))
+    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(cfg))
     url = f"http://127.0.0.1:{port}/"
     print(f"wbl: serving {cfg.root} at {url}  (Ctrl-C to stop)")
     if open_browser:

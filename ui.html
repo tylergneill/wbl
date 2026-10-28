@@ -40,9 +40,7 @@
            position: sticky; top: 0; z-index: 5; }
   header h1 { font-size: 17px; margin: 0 8px 0 0; letter-spacing: .02em; }
   header .spacer { flex: 1; }
-  #jobs { font-size: 12px; color: var(--muted); }
-  #jobs .running::before { content: "● "; color: var(--p1); }
-  #jobs button { padding: 0 6px; font-size: 11px; margin-left: 4px; }
+  #status { font-size: 12px; color: var(--muted); }
   .card .busy { font-size: 11px; color: var(--p1); }
 
   main { display: grid; grid-template-columns: repeat(5, minmax(220px, 1fr)); gap: 14px;
@@ -102,13 +100,14 @@
   .actions { display: flex; gap: 8px; margin: 14px 0; flex-wrap: wrap; }
   .spec { border-top: 1px solid var(--line); margin-top: 10px; }
   .spec h1, .spec h2, .spec h3 { font-size: 15px; margin: 18px 0 6px; }
-  .spec pre, pre.diff { background: var(--code); padding: 10px; border-radius: 6px; overflow-x: auto; }
+  .spec pre { background: var(--code); padding: 10px; border-radius: 6px; overflow-x: auto; }
   .spec code { background: var(--code); padding: 1px 4px; border-radius: 3px; }
   .spec pre code { background: none; padding: 0; }
-  pre.diff span { display: block; }
-  pre.diff .a { background: var(--add); }
-  pre.diff .d { background: var(--del); }
-  pre.diff .h { color: var(--accent); }
+  #drawer textarea { width: 100%; min-height: 360px; font: 12.5px/1.45 ui-monospace, Menlo, monospace;
+                     background: var(--code); color: var(--ink); border: 1px solid var(--line);
+                     border-radius: 6px; padding: 10px; }
+  #drawer input.title { width: 100%; font-size: 16px; padding: 4px 6px; margin: 4px 0 10px;
+                        background: var(--code); border: 1px solid var(--line); border-radius: 6px; }
   #ctx { position: fixed; z-index: 30; background: var(--panel); border: 1px solid var(--line);
          border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,.18); padding: 4px; min-width: 170px;
          display: none; }
@@ -128,8 +127,9 @@
   <select id="projectFilter"><option value="">All projects</option></select>
   <button id="prepBtn" disabled>Prep selected</button>
   <button id="doBtn" class="primary" disabled>Do selected</button>
+  <button id="exportBtn" disabled title="download the selected tickets as one markdown file">Export selected</button>
   <span class="spacer"></span>
-  <span id="jobs"></span>
+  <span id="status"></span>
 </header>
 <main id="board"></main>
 <aside id="drawer"></aside>
@@ -146,6 +146,7 @@ let state = null;
 const selected = new Set();
 let openId = null;
 let openSnapshot = "";   // JSON of the ticket when the drawer was drawn, to redraw only on change
+let editing = false;     // the open ticket's title and text are being edited
 
 const COLUMNS = [
   ["inbox", "Inbox"], ["pending", "Pending"], ["in_progress", "In progress"],
@@ -220,19 +221,12 @@ function usageNote(kind) {
   const range = mtok(xs[0]) === mtok(xs.at(-1)) ? "" : `, range ${mtok(xs[0])}–${mtok(xs.at(-1))}`;
   return `Past ${NOUN[kind]} runs: typically ${mtok(median)} tokens (median of ${xs.length}${range}).`;
 }
-function limitNote(kind) {
-  const each = state[`${kind}_budget_usd`];
-  return each ? `Each run is stopped at $${each.toFixed(2)}.` : "No per-run limit is set.";
-}
-const spendTitle = (kind) => `Spends tokens. ${usageNote(kind)} ${limitNote(kind)}`;
+const spendTitle = (kind) =>
+  `Spends tokens: opens a Claude Code session in ${state.terminal}. ${usageNote(kind)} ` +
+  "There is no spending limit; you quit the session yourself.";
 const prepLabel = () => `Prep${TOKEN}`;
-const doLabel = (t) => `${t.worktree ? "Do again" : "Do"}${TOKEN}`;
-
-// An inbox item is being prepped if a running triage job names it.
-function triaging(item) {
-  return state.jobs.some((j) => j.running && j.kind === "triage" &&
-    j.args.includes(`${item.project}/${item.image}`));
-}
+const doLabel = (t) => `${t.session || t.tokens ? "Do again" : "Do"}${TOKEN}`;
+const triaging = (item) => item.prepping;   // its Prep session is open
 
 function toast(msg, ms = 3500) {
   const el = $("#toast");
@@ -272,16 +266,6 @@ function md(src) {
   if (code !== null) out.push(`<pre><code>${esc(code.join("\n"))}</code></pre>`);
   flushPara(); flushList();
   return out.join("\n");
-}
-
-function diffHtml(text) {
-  return text.split("\n").map((l) => {
-    const cls = l.startsWith("+") && !l.startsWith("+++") ? "a"
-              : l.startsWith("-") && !l.startsWith("---") ? "d"
-              : l.startsWith("@@") || l.startsWith("diff ") ? "h" : "";
-    // Every line is its own block-level span, so no "\n" between them (that double-spaces).
-    return `<span class="${cls}">${esc(l) || " "}</span>`;
-  }).join("");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -363,13 +347,7 @@ function renderBoard() {
   $("#doBtn").title = spendTitle("resolve");
   $("#doBtn").disabled = !dos.length;
 
-  const running = state.jobs.filter((j) => j.running);
-  const last = state.jobs.at(-1);
-  const verb = {triage: "prep", resolve: "do"};
-  $("#jobs").innerHTML = running.length
-    ? running.map((j) => `<span class="running">${verb[j.kind] ?? j.kind} ${esc(j.args.length > 2 ? `${j.args.length} items` : j.args.join(", "))}</span>` +
-        `<button onclick="cancelJob(${j.id})" title="stop this run and its agents">cancel</button>`).join(" · ")
-    : (last ? `last job: ${esc(verb[last.kind] ?? last.kind)} (${last.cancelled ? "cancelled" : `exit ${last.exit_code}`})` : "");
+  $("#exportBtn").disabled = !selectedDos().length;
 }
 
 const selectedPreps = () => [...selected].filter(isInbox).map((k) => k.slice(6));
@@ -395,7 +373,8 @@ function renderDrawer(force = false) {
       <div class="kv">${esc(project)} · untriaged${multi(project)
         ? ` · Prep will pick the component: ${proj(project).components.map((c) => `<span class="comp">${esc(compLabel(project, c))}</span>`).join(" ")}` : ""}</div>
       <div class="actions">
-        ${triaging(item) ? '<span class="kv">prepping…</span>'
+        ${triaging(item) ? `<span class="kv">Prepping in a ${esc(state.terminal)} window: the ticket appears when Claude finishes.</span>
+             <button onclick='unprep(${esc(JSON.stringify(`${project}/${image}`))})' title="if its window is gone without a ticket">Not prepping</button>`
           : `<button class="primary" onclick='prep([${esc(JSON.stringify(`${project}/${image}`))}])' title="${spendTitle("triage")}">${prepLabel()}</button>`}
       </div>
       ${previewHtml(item)}`;
@@ -407,47 +386,56 @@ function renderDrawer(force = false) {
   const t = state.tickets.find((x) => x.id === openId);
   if (!t) { closeDrawer(); return; }
   const snap = JSON.stringify(t);
-  // Don't clobber the drawer while you're using a dropdown, and skip redraws when nothing changed.
-  if (!force && (snap === openSnapshot || d.contains(document.activeElement) && document.activeElement.tagName === "SELECT")) return;
+  // Don't clobber the drawer while you're editing or using a dropdown, and skip redraws when
+  // nothing changed.
+  if (!force && (editing || snap === openSnapshot ||
+                 d.contains(document.activeElement) && document.activeElement.tagName === "SELECT")) return;
   openSnapshot = snap;
 
+  const running = t.status === "in_progress";
   const opt = (vals, cur) => vals.map((v) => `<option ${v == cur ? "selected" : ""}>${v}</option>`).join("");
   d.innerHTML = `
     <button onclick="closeDrawer()">Close</button>
     <div class="where">${esc(t.project)}${multi(t.project) ? ` › ${compChip(t)}` : ""}</div>
-    <h2>${esc(t.id)} · ${esc(t.title)}</h2>
+    ${editing ? `<input class="title" id="editTitle" value="${esc(t.title)}">` : `<h2>${esc(t.id)} · ${esc(t.title)}</h2>`}
     ${previewHtml(t)}
     <div class="fields">
       <label>Priority <select data-field="priority">${opt(state.priorities, t.priority)}</select></label>
       <label>Points <select data-field="points">${opt(state.points, t.points)}</select></label>
       <label>Status <select data-field="status">${opt(state.statuses, t.status)}</select></label>
-      ${multi(t.project) ? `<label>Component <select data-field="component" ${t.worktree ? "disabled title=\"has a worktree already\"" : ""}>${proj(t.project).components.map((c) => `<option value="${esc(c)}" ${c === t.component ? "selected" : ""}>${esc(compLabel(t.project, c))}</option>`).join("")}</select></label>` : ""}
+      ${multi(t.project) ? `<label>Component <select data-field="component" ${t.worktree || running ? "disabled title=\"being or already worked on\"" : ""}>${proj(t.project).components.map((c) => `<option value="${esc(c)}" ${c === t.component ? "selected" : ""}>${esc(compLabel(t.project, c))}</option>`).join("")}</select></label>` : ""}
     </div>
     <div class="kv">${esc(t.image)} · created ${esc(t.created)}${multi(t.project) ? ` · repo <code>${esc(t.component)}</code>` : ""}</div>
-    ${t.branch ? `<div class="kv">branch <code>${esc(t.branch)}</code> in <code>${esc(t.worktree)}</code></div>` : ""}
-    ${t.prep_tokens ? `<div class="kv">prep: ${mtok(t.prep_tokens)} tokens ($${Number(t.prep_cost_usd).toFixed(2)})</div>` : ""}
-    ${t.tokens ? `<div class="kv">last do: ${mtok(t.tokens)} tokens ($${Number(t.cost_usd).toFixed(2)})</div>` : ""}
-    ${t.resume_cmd ? `<div class="kv">continue by hand: <code>${esc(t.resume_cmd)}</code>
+    ${t.workdir ? `<div class="kv">Do works in <code>${esc(t.workdir)}</code>${t.branch ? `, branch <code>${esc(t.branch)}</code>` : ", on whatever branch is checked out"}</div>` : ""}
+    ${t.prep_tokens ? `<div class="kv">prep: ${mtok(t.prep_tokens)} tokens${t.prep_cost_usd != null ? ` ($${Number(t.prep_cost_usd).toFixed(2)})` : ""}</div>` : ""}
+    ${t.tokens ? `<div class="kv">do: ${mtok(t.tokens)} tokens${t.cost_usd != null ? ` ($${Number(t.cost_usd).toFixed(2)})` : ""}</div>` : ""}
+    ${running ? `<div class="kv">Claude is working in a ${esc(state.terminal)} window. Its report lands here each time it finishes; ` +
+        "follow up there or close it whenever. If the window is gone, set Status back by hand.</div>" : ""}
+    ${t.resume_cmd ? `<div class="kv">session by hand: <code>${esc(t.resume_cmd)}</code>
         <button onclick="navigator.clipboard.writeText(${esc(JSON.stringify(t.resume_cmd))}); toast('copied')">copy</button></div>` : ""}
     <div class="actions">
       ${DOABLE.includes(t.status) && hasRepo(t.project) ? `<button class="primary" onclick="doTickets(['${esc(t.id)}'])" title="${spendTitle("resolve")}">${doLabel(t)}</button>` : ""}
-      ${t.worktree ? `<button onclick="showDiff('${esc(t.id)}')">Show changes</button>` : ""}
-      ${t.status !== "in_progress" && !t.image_missing ? `<button onclick="discard(['${esc(t.id)}'], true)" title="${spendTitle("triage")}">Re-prep${TOKEN}</button>` : ""}
+      ${DOABLE.includes(t.status) && t.session && t.status !== "pending" ? `<button onclick="continueTicket('${esc(t.id)}')" title="Pick up the last session in a ${esc(state.terminal)} window, with its history. Spends tokens; no spending limit, you quit it yourself.">Continue in terminal${TOKEN}</button>` : ""}
+      ${editing ? `<button class="primary" onclick="saveEdit('${esc(t.id)}')">Save</button> <button onclick="editing = false; renderDrawer(true)">Cancel</button>`
+        : `<button onclick="editing = true; renderDrawer(true)">Edit</button>`}
+      <button onclick="exportTickets(['${esc(t.id)}'])">Export .md</button>
       ${t.status !== "in_progress" ? `<button onclick="discard(['${esc(t.id)}'])" title="delete the ticket, keep the screenshot (it returns to the inbox)">Discard</button>` : ""}
       <button class="danger" onclick="finish('${esc(t.id)}')">Done (clean up)</button>
     </div>
-    <div id="diff"></div>
-    <div class="spec">${md(t.body)}</div>`;
+    ${editing ? `<textarea id="editBody">${esc(t.body)}</textarea>` : `<div class="spec">${md(t.body)}</div>`}`;
   fillNotes(d);
   d.classList.add("open");
 }
 
-function openDrawer(id) { openId = id; openSnapshot = ""; renderDrawer(true); }
-function closeDrawer() { openId = null; $("#drawer").classList.remove("open"); }
+function openDrawer(id) { openId = id; openSnapshot = ""; editing = false; renderDrawer(true); }
+function closeDrawer() { openId = null; editing = false; $("#drawer").classList.remove("open"); }
 
-async function showDiff(id) {
-  const {diff} = await api(`/api/tickets/${id}/diff`);
-  $("#diff").innerHTML = diff.trim() ? `<pre class="diff">${diffHtml(diff)}</pre>` : '<div class="empty">no changes yet</div>';
+async function saveEdit(id) {
+  try {
+    await api(`/api/tickets/${id}`, {title: $("#editTitle").value, body: $("#editBody").value});
+    editing = false; toast(`${id} saved`);
+  } catch (e) { toast(e.message, 6000); }
+  await refresh(); renderDrawer(true);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -459,10 +447,10 @@ async function setField(id, field, value) {
   refresh();
 }
 
-// One item starts right away (its button already shows the cap); several ask first.
-async function prep(keys, ask = true) {
-  if (ask && keys.length > 1 && !confirm(`Prep ${keys.length} screenshots?\n\n` +
-      `This starts ${keys.length} agents, ${state.max_parallel} at a time.\n${usageNote("triage")}\n${limitNote("triage")}`)) return;
+// One item starts right away; several ask first.
+async function prep(keys) {
+  if (keys.length > 1 && !confirm(`Prep ${keys.length} screenshots?\n\n` +
+      `This opens ${keys.length} ${state.terminal} windows, a Claude Code session in each.\n${usageNote("triage")}`)) return;
   try {
     await api("/api/triage", {images: keys});
     keys.forEach((k) => selected.delete(`inbox:${k}`)); renderBoard();
@@ -471,17 +459,25 @@ async function prep(keys, ask = true) {
   setTimeout(refresh, 600);
 }
 
-async function cancelJob(id) {
-  try { await api(`/api/jobs/${id}/cancel`, {}); toast("cancelled"); }
-  catch (e) { toast(e.message); }
+async function unprep(item) {
+  try { await api("/api/unprep", {image: item}); } catch (e) { toast(e.message); }
   refresh();
 }
 
 async function doTickets(ids) {
   if (ids.length > 1 && !confirm(`Start agents on ${ids.join(", ")}?\n\n` +
-      `Each works in its own git worktree, ${state.max_parallel} at a time.\n${usageNote("resolve")}\n${limitNote("resolve")}`)) return;
-  try { await api("/api/resolve", {ids}); ids.forEach((i) => selected.delete(i)); renderBoard(); toast(`started agent(s) on ${ids.join(", ")}`); }
-  catch (e) { toast(e.message); }
+      `This opens ${ids.length} ${state.terminal} windows, a Claude Code session in each, working in ` +
+      `its project's checkout on the branch you have checked out.\n${usageNote("resolve")}`)) return;
+  try {
+    await api("/api/resolve", {ids}); ids.forEach((i) => selected.delete(i)); renderBoard();
+    toast(`opened ${ids.join(", ")} in ${state.terminal}`);
+  } catch (e) { toast(e.message, 6000); }
+  setTimeout(refresh, 600);
+}
+
+async function continueTicket(id) {
+  try { await api(`/api/tickets/${id}/continue`, {}); toast(`opened ${id} in ${state.terminal}`); }
+  catch (e) { toast(e.message, 6000); }
   setTimeout(refresh, 600);
 }
 
@@ -500,32 +496,19 @@ async function removeTicket(id, how) {
 }
 
 async function finish(id) {
-  if (!confirm(`Finish ${id}? This deletes the ticket and its screenshot, and removes its worktree.`)) return;
+  if (!confirm(`Finish ${id}? This deletes the ticket and its screenshot. Your checkout is left as it is.`)) return;
   if (await removeTicket(id, "done")) closeDrawer();
   refresh();
 }
 
-// Discard tickets but keep their screenshots; with `reprep`, prep those screenshots again.
-// Re-prepped tickets get new IDs, since IDs are never reused.
-async function discard(ids, reprep = false) {
+// Discard tickets but keep their screenshots, which go back to the inbox.
+async function discard(ids) {
   const tickets = ids.map((i) => state.tickets.find((t) => t.id === i)).filter(Boolean);
-  const list = ids.join(", ");
-  const msg = reprep
-    ? `Re-prep ${list}?\n\nThe ticket${ids.length > 1 ? "s are" : " is"} replaced by a fresh Prep of the same screenshot (new ID). ` +
-      `Any Do work in a worktree is removed.\n${usageNote("triage")}\n${limitNote("triage")}`
-    : `Discard ${list}?\n\nThe ticket${ids.length > 1 ? "s are" : " is"} deleted, and the screenshot goes back to the inbox. ` +
-      `Any Do work in a worktree is removed.`;
-  if (!confirm(msg)) return;
-  const again = [];
-  for (const t of tickets) {
-    if (await removeTicket(t.id, "discard")) {
-      selected.delete(t.id);
-      if (reprep && !t.image_missing) again.push(`${t.project}/${t.image}`);
-    }
-  }
+  if (!confirm(`Discard ${ids.join(", ")}?\n\nThe ticket${ids.length > 1 ? "s are" : " is"} deleted, ` +
+               "and the screenshot goes back to the inbox.")) return;
+  for (const t of tickets) if (await removeTicket(t.id, "discard")) selected.delete(t.id);
   if (openId && ids.includes(openId)) closeDrawer();
   await refresh();
-  if (again.length) await prep(again, false);
 }
 
 function toggle(key, on = !selected.has(key)) { on ? selected.add(key) : selected.delete(key); }
@@ -553,8 +536,9 @@ $("#drawer").addEventListener("change", (ev) => {
   if (ev.target.dataset.field) setField(openId, ev.target.dataset.field, ev.target.value);
 });
 $("#projectFilter").addEventListener("change", renderBoard);
-$("#prepBtn").addEventListener("click", () => prep(selectedPreps()));
-$("#doBtn").addEventListener("click", () => doTickets(selectedDoables()));
+// The server answers with Content-Disposition: attachment, so this downloads without leaving the page.
+const exportTickets = (ids) => { location.href = `/api/export?ids=${encodeURIComponent(ids.join(","))}`; };
+$("#exportBtn").addEventListener("click", () => exportTickets(selectedDos()));
 // Right-click menu on any card. On a card that is part of a selection, it acts on the whole
 // selection of that kind; otherwise on the card alone.
 function closeMenu() { $("#ctx").style.display = "none"; }
@@ -580,9 +564,6 @@ $("#board").addEventListener("contextmenu", (ev) => {
       items.push([doable.length > 1 ? `Do ${doable.length} selected${TOKEN}` : doLabel(t), () => doTickets(doable), false, spendTitle("resolve")]);
     if (DOABLE.includes(t.status)) {
       const n = group.length > 1 ? ` ${group.length} selected` : "";
-      const reprepable = group.filter((id) => !state.tickets.find((x) => x.id === id)?.image_missing);
-      if (reprepable.length) items.push([`Re-prep${reprepable.length > 1 ? ` ${reprepable.length} selected` : ""}${TOKEN}`,
-                                         () => discard(reprepable, true), false, spendTitle("triage")]);
       items.push([`Discard${n}`, () => discard(group), false, "delete the ticket, keep the screenshot (it returns to the inbox)"]);
     }
   }
@@ -620,7 +601,8 @@ document.addEventListener("keydown", (ev) => {
 // Polling
 // ---------------------------------------------------------------------------------------------
 async function refresh() {
-  try { state = await api("/api/state"); } catch (e) { $("#jobs").textContent = "server unreachable"; return; }
+  try { state = await api("/api/state"); $("#status").textContent = ""; }
+  catch (e) { $("#status").textContent = "server unreachable"; return; }
   const pf = $("#projectFilter");
   if (pf.options.length === 1) {
     for (const p of state.projects) {
